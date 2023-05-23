@@ -1,239 +1,472 @@
-use futures::future::{loop_fn, Loop};
-use futures::sync::mpsc::{channel, Receiver, Sender};
-use std::collections::HashMap;
-use std::ops::Deref;
-use std::sync::RwLock;
-use uuid::Uuid;
+use crate::polling_monitor::IpfsService;
+use crate::subgraph::context::{IndexingContext, SubgraphKeepAlive};
+use crate::subgraph::inputs::IndexingInputs;
+use crate::subgraph::loader::load_dynamic_data_sources;
 
-use graph::data::subgraph::schema::{
-    DynamicEthereumContractDataSourceEntity, SubgraphDeploymentEntity,
-};
-use graph::prelude::{SubgraphInstance as SubgraphInstanceTrait, *};
+use crate::subgraph::runner::SubgraphRunner;
+use graph::blockchain::block_stream::BlockStreamMetrics;
+use graph::blockchain::Blockchain;
+use graph::blockchain::NodeCapabilities;
+use graph::blockchain::{BlockchainKind, TriggerFilter};
+use graph::components::subgraph::ProofOfIndexingVersion;
+use graph::data::subgraph::{UnresolvedSubgraphManifest, SPEC_VERSION_0_0_6};
+use graph::data_source::causality_region::CausalityRegionSeq;
+use graph::env::EnvVars;
+use graph::prelude::{SubgraphInstanceManager as SubgraphInstanceManagerTrait, *};
+use graph::{blockchain::BlockchainMap, components::store::DeploymentLocator};
+use graph_runtime_wasm::module::ToAscPtr;
+use graph_runtime_wasm::RuntimeHostBuilder;
+use tokio::task;
 
-use super::SubgraphInstance;
+use super::context::OffchainMonitor;
+use super::SubgraphTriggerProcessor;
 
-type SharedInstanceKeepAliveMap = Arc<RwLock<HashMap<SubgraphDeploymentId, CancelGuard>>>;
-
-struct IndexingInputs<B, S, T> {
-    deployment_id: SubgraphDeploymentId,
-    network_name: String,
-    store: Arc<S>,
-    stream_builder: B,
-    host_builder: T,
-    templates_use_calls: bool,
-    top_level_templates: Vec<DataSourceTemplate>,
+#[derive(Clone)]
+pub struct SubgraphInstanceManager<S: SubgraphStore> {
+    logger_factory: LoggerFactory,
+    subgraph_store: Arc<S>,
+    chains: Arc<BlockchainMap>,
+    metrics_registry: Arc<MetricsRegistry>,
+    instances: SubgraphKeepAlive,
+    link_resolver: Arc<dyn LinkResolver>,
+    ipfs_service: IpfsService,
+    static_filters: bool,
+    env_vars: Arc<EnvVars>,
 }
 
-struct IndexingState<T>
-where
-    T: RuntimeHostBuilder,
-{
-    logger: Logger,
-    instance: SubgraphInstance<T>,
-    instances: SharedInstanceKeepAliveMap,
-    log_filter: EthereumLogFilter,
-    call_filter: EthereumCallFilter,
-    block_filter: EthereumBlockFilter,
-    restarts: u64,
-}
+#[async_trait]
+impl<S: SubgraphStore> SubgraphInstanceManagerTrait for SubgraphInstanceManager<S> {
+    async fn start_subgraph(
+        self: Arc<Self>,
+        loc: DeploymentLocator,
+        manifest: serde_yaml::Mapping,
+        stop_block: Option<BlockNumber>,
+    ) {
+        let logger = self.logger_factory.subgraph_logger(&loc);
+        let err_logger = logger.clone();
+        let instance_manager = self.cheap_clone();
 
-struct IndexingContext<B, S, T>
-where
-    B: BlockStreamBuilder,
-    S: Store + ChainStore,
-    T: RuntimeHostBuilder,
-{
-    /// Read only inputs that are needed while indexing a subgraph.
-    pub inputs: IndexingInputs<B, S, T>,
+        let subgraph_start_future = async move {
+            match BlockchainKind::from_manifest(&manifest)? {
+                BlockchainKind::Arweave => {
+                    let runner = instance_manager
+                        .build_subgraph_runner::<graph_chain_arweave::Chain>(
+                            logger.clone(),
+                            self.env_vars.cheap_clone(),
+                            loc.clone(),
+                            manifest,
+                            stop_block,
+                            Box::new(SubgraphTriggerProcessor {}),
+                        )
+                        .await?;
 
-    /// Mutable state that may be modified while indexing a subgraph.
-    pub state: IndexingState<T>,
-}
+                    self.start_subgraph_inner(logger, loc, runner).await
+                }
+                BlockchainKind::Ethereum => {
+                    let runner = instance_manager
+                        .build_subgraph_runner::<graph_chain_ethereum::Chain>(
+                            logger.clone(),
+                            self.env_vars.cheap_clone(),
+                            loc.clone(),
+                            manifest,
+                            stop_block,
+                            Box::new(SubgraphTriggerProcessor {}),
+                        )
+                        .await?;
 
-pub struct SubgraphInstanceManager {
-    logger: Logger,
-    input: Sender<SubgraphAssignmentProviderEvent>,
-}
+                    self.start_subgraph_inner(logger, loc, runner).await
+                }
+                BlockchainKind::Near => {
+                    let runner = instance_manager
+                        .build_subgraph_runner::<graph_chain_near::Chain>(
+                            logger.clone(),
+                            self.env_vars.cheap_clone(),
+                            loc.clone(),
+                            manifest,
+                            stop_block,
+                            Box::new(SubgraphTriggerProcessor {}),
+                        )
+                        .await?;
 
-impl SubgraphInstanceManager {
-    /// Creates a new runtime manager.
-    pub fn new<B, S, T>(
-        logger_factory: &LoggerFactory,
-        stores: HashMap<String, Arc<S>>,
-        host_builder: T,
-        block_stream_builder: B,
-    ) -> Self
-    where
-        S: Store + ChainStore,
-        T: RuntimeHostBuilder,
-        B: BlockStreamBuilder,
-    {
-        let logger = logger_factory.component_logger("SubgraphInstanceManager", None);
-        let logger_factory = logger_factory.with_parent(logger.clone());
+                    self.start_subgraph_inner(logger, loc, runner).await
+                }
+                BlockchainKind::Cosmos => {
+                    let runner = instance_manager
+                        .build_subgraph_runner::<graph_chain_cosmos::Chain>(
+                            logger.clone(),
+                            self.env_vars.cheap_clone(),
+                            loc.clone(),
+                            manifest,
+                            stop_block,
+                            Box::new(SubgraphTriggerProcessor {}),
+                        )
+                        .await?;
 
-        // Create channel for receiving subgraph provider events.
-        let (subgraph_sender, subgraph_receiver) = channel(100);
+                    self.start_subgraph_inner(logger, loc, runner).await
+                }
+                BlockchainKind::Substreams => {
+                    let runner = instance_manager
+                        .build_subgraph_runner::<graph_chain_substreams::Chain>(
+                            logger.clone(),
+                            self.env_vars.cheap_clone(),
+                            loc.cheap_clone(),
+                            manifest,
+                            stop_block,
+                            Box::new(graph_chain_substreams::TriggerProcessor::new(loc.clone())),
+                        )
+                        .await?;
 
-        // Handle incoming events from the subgraph provider.
-        Self::handle_subgraph_events(
-            logger_factory,
-            subgraph_receiver,
-            stores,
-            host_builder,
-            block_stream_builder,
-        );
+                    self.start_subgraph_inner(logger, loc, runner).await
+                }
+            }
+        };
 
-        SubgraphInstanceManager {
-            logger,
-            input: subgraph_sender,
-        }
+        // Perform the actual work of starting the subgraph in a separate
+        // task. If the subgraph is a graft or a copy, starting it will
+        // perform the actual work of grafting/copying, which can take
+        // hours. Running it in the background makes sure the instance
+        // manager does not hang because of that work.
+        graph::spawn(async move {
+            match subgraph_start_future.await {
+                Ok(()) => {}
+                Err(err) => error!(
+                    err_logger,
+                    "Failed to start subgraph";
+                    "error" => format!("{:#}", err),
+                    "code" => LogCode::SubgraphStartFailure
+                ),
+            }
+        });
     }
 
-    /// Handle incoming events from subgraph providers.
-    fn handle_subgraph_events<B, S, T>(
-        logger_factory: LoggerFactory,
-        receiver: Receiver<SubgraphAssignmentProviderEvent>,
-        stores: HashMap<String, Arc<S>>,
-        host_builder: T,
-        block_stream_builder: B,
-    ) where
-        S: Store + ChainStore,
-        T: RuntimeHostBuilder,
-        B: BlockStreamBuilder,
-    {
-        // Subgraph instance shutdown senders
-        let instances: SharedInstanceKeepAliveMap = Default::default();
+    async fn stop_subgraph(&self, loc: DeploymentLocator) {
+        let logger = self.logger_factory.subgraph_logger(&loc);
 
-        tokio::spawn(receiver.for_each(move |event| {
-            use self::SubgraphAssignmentProviderEvent::*;
-
-            match event {
-                SubgraphStart(manifest) => {
-                    let logger = logger_factory.subgraph_logger(&manifest.id);
-
-                    info!(
-                        logger,
-                        "Start subgraph";
-                        "data_sources" => manifest.data_sources.len()
-                    );
-
-                    match manifest.network_name() {
-                        Ok(n) => {
-                            Self::start_subgraph(
-                                logger.clone(),
-                                instances.clone(),
-                                host_builder.clone(),
-                                block_stream_builder.clone(),
-                                stores
-                                    .get(&n)
-                                    .expect(&format!(
-                                        "expected store that matches subgraph network: {}",
-                                        &n
-                                    ))
-                                    .clone(),
-                                manifest,
-                            )
-                            .map_err(|err| {
-                                error!(
-                                    logger,
-                                    "Failed to start subgraph";
-                                    "error" => format!("{}", err),
-                                    "code" => LogCode::SubgraphStartFailure
-                                )
-                            })
-                            .ok();
-                        }
-                        Err(err) => error!(
-                            logger,
-                            "Failed to start subgraph";
-                             "error" => format!("{}", err),
-                            "code" => LogCode::SubgraphStartFailure
-                        ),
-                    };
-                }
-                SubgraphStop(id) => {
-                    let logger = logger_factory.subgraph_logger(&id);
-                    info!(logger, "Stop subgraph");
-
-                    Self::stop_subgraph(instances.clone(), id);
-                }
-            };
-
-            Ok(())
-        }));
-    }
-
-    fn start_subgraph<B, T, S>(
-        logger: Logger,
-        instances: SharedInstanceKeepAliveMap,
-        host_builder: T,
-        stream_builder: B,
-        store: Arc<S>,
-        manifest: SubgraphManifest,
-    ) -> Result<(), Error>
-    where
-        T: RuntimeHostBuilder,
-        B: BlockStreamBuilder,
-        S: Store + ChainStore,
-    {
-        // Clear the 'failed' state of the subgraph. We were told explicitly
-        // to start, which implies we assume the subgraph has not failed (yet)
-        // If we can't even clear the 'failed' flag, don't try to start
-        // the subgraph.
-        let status_ops = SubgraphDeploymentEntity::update_failed_operations(&manifest.id, false);
-        store.start_subgraph_deployment(&manifest.id, status_ops)?;
-
-        let mut templates: Vec<DataSourceTemplate> = vec![];
-        for data_source in manifest.data_sources.iter() {
-            for template in data_source.templates.iter() {
-                templates.push(template.clone());
+        match self.subgraph_store.stop_subgraph(&loc).await {
+            Ok(()) => debug!(logger, "Stopped subgraph writer"),
+            Err(err) => {
+                error!(logger, "Error stopping subgraph writer"; "error" => format!("{:#}", err))
             }
         }
 
-        // Clone the deployment ID for later
-        let deployment_id = manifest.id.clone();
-        let network_name = manifest.network_name()?;
+        self.instances.remove(&loc.id);
 
-        // Obtain filters from the manifest
-        let log_filter = EthereumLogFilter::from_data_sources(&manifest.data_sources);
-        let call_filter = EthereumCallFilter::from_data_sources(&manifest.data_sources);
-        let block_filter = EthereumBlockFilter::from_data_sources(&manifest.data_sources);
+        info!(logger, "Stopped subgraph");
+    }
+}
 
-        // Identify whether there are templates with call handlers or
-        // block handlers with call filters; in this case, we need to
-        // include calls in all blocks so we cen reprocess the block
-        // when new dynamic data sources are being created
-        let templates_use_calls = templates.iter().any(|template| {
-            template.has_call_handler() || template.has_block_handler_with_call_filter()
-        });
+impl<S: SubgraphStore> SubgraphInstanceManager<S> {
+    pub fn new(
+        logger_factory: &LoggerFactory,
+        env_vars: Arc<EnvVars>,
+        subgraph_store: Arc<S>,
+        chains: Arc<BlockchainMap>,
+        sg_metrics: Arc<SubgraphCountMetric>,
+        metrics_registry: Arc<MetricsRegistry>,
+        link_resolver: Arc<dyn LinkResolver>,
+        ipfs_service: IpfsService,
+        static_filters: bool,
+    ) -> Self {
+        let logger = logger_factory.component_logger("SubgraphInstanceManager", None);
+        let logger_factory = logger_factory.with_parent(logger.clone());
 
-        let top_level_templates = manifest.templates.clone();
+        SubgraphInstanceManager {
+            logger_factory,
+            subgraph_store,
+            chains,
+            metrics_registry: metrics_registry.cheap_clone(),
+            instances: SubgraphKeepAlive::new(sg_metrics),
+            link_resolver,
+            ipfs_service,
+            static_filters,
+            env_vars,
+        }
+    }
+
+    pub async fn build_subgraph_runner<C>(
+        &self,
+        logger: Logger,
+        env_vars: Arc<EnvVars>,
+        deployment: DeploymentLocator,
+        manifest: serde_yaml::Mapping,
+        stop_block: Option<BlockNumber>,
+        tp: Box<dyn TriggerProcessor<C, RuntimeHostBuilder<C>>>,
+    ) -> anyhow::Result<SubgraphRunner<C, RuntimeHostBuilder<C>>>
+    where
+        C: Blockchain,
+        <C as Blockchain>::MappingTrigger: ToAscPtr,
+    {
+        let subgraph_store = self.subgraph_store.cheap_clone();
+        let registry = self.metrics_registry.cheap_clone();
+
+        let raw_yaml = serde_yaml::to_string(&manifest).unwrap();
+        let manifest = UnresolvedSubgraphManifest::parse(deployment.hash.cheap_clone(), manifest)?;
+
+        // Allow for infinite retries for subgraph definition files.
+        let link_resolver = Arc::from(self.link_resolver.with_retries());
+
+        // Make sure the `raw_yaml` is present on both this subgraph and the graft base.
+        self.subgraph_store
+            .set_manifest_raw_yaml(&deployment.hash, raw_yaml)
+            .await?;
+        if let Some(graft) = &manifest.graft {
+            if self.subgraph_store.is_deployed(&graft.base)? {
+                let file_bytes = self
+                    .link_resolver
+                    .cat(&logger, &graft.base.to_ipfs_link())
+                    .await?;
+                let yaml = String::from_utf8(file_bytes)?;
+
+                self.subgraph_store
+                    .set_manifest_raw_yaml(&graft.base, yaml)
+                    .await?;
+            }
+        }
+
+        info!(logger, "Resolve subgraph files using IPFS";
+            "n_data_sources" => manifest.data_sources.len(),
+            "n_templates" => manifest.templates.len(),
+        );
+
+        let mut manifest = manifest
+            .resolve(&link_resolver, &logger, ENV_VARS.max_spec_version.clone())
+            .await?;
+
+        {
+            let features = if manifest.features.is_empty() {
+                "ø".to_string()
+            } else {
+                manifest
+                    .features
+                    .iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            info!(logger, "Successfully resolved subgraph files using IPFS";
+                "n_data_sources" => manifest.data_sources.len(),
+                "n_templates" => manifest.templates.len(),
+                "features" => features
+            );
+        }
+
+        let store = self
+            .subgraph_store
+            .cheap_clone()
+            .writable(
+                logger.clone(),
+                deployment.id,
+                Arc::new(manifest.template_idx_and_name().collect()),
+            )
+            .await?;
+
+        // Start the subgraph deployment before reading dynamic data
+        // sources; if the subgraph is a graft or a copy, starting it will
+        // do the copying and dynamic data sources won't show up until after
+        // that is done
+        store.start_subgraph_deployment(&logger).await?;
+
+        // Dynamic data sources are loaded by appending them to the manifest.
+        //
+        // Refactor: Preferrably we'd avoid any mutation of the manifest.
+        let (manifest, static_data_sources) = {
+            let data_sources = load_dynamic_data_sources(store.clone(), logger.clone(), &manifest)
+                .await
+                .context("Failed to load dynamic data sources")?;
+
+            let static_data_sources = manifest.data_sources.clone();
+
+            // Add dynamic data sources to the subgraph
+            manifest.data_sources.extend(data_sources);
+
+            info!(
+                logger,
+                "Data source count at start: {}",
+                manifest.data_sources.len()
+            );
+
+            (manifest, static_data_sources)
+        };
+
+        let static_filters =
+            self.static_filters || manifest.data_sources.len() >= ENV_VARS.static_filters_threshold;
+
+        let onchain_data_sources = manifest
+            .data_sources
+            .iter()
+            .filter_map(|d| d.as_onchain().cloned())
+            .collect::<Vec<_>>();
+        let required_capabilities = C::NodeCapabilities::from_data_sources(&onchain_data_sources);
+        let network = manifest.network_name();
+
+        let chain = self
+            .chains
+            .get::<C>(network.clone())
+            .with_context(|| format!("no chain configured for network {}", network))?
+            .clone();
+
+        // if static_filters is enabled, build a minimal filter with the static data sources and
+        // add the necessary filters based on templates.
+        // if not enabled we just stick to the filter based on all the data sources.
+        // This specifically removes dynamic data sources based filters because these can be derived
+        // from templates AND this reduces the cost of egress traffic by making the payloads smaller.
+        let filter = if static_filters {
+            if !self.static_filters {
+                info!(logger, "forcing subgraph to use static filters.")
+            }
+
+            let onchain_data_sources = static_data_sources.iter().filter_map(|d| d.as_onchain());
+
+            let mut filter = C::TriggerFilter::from_data_sources(onchain_data_sources);
+
+            filter.extend_with_template(
+                manifest
+                    .templates
+                    .iter()
+                    .filter_map(|ds| ds.as_onchain())
+                    .cloned(),
+            );
+            filter
+        } else {
+            C::TriggerFilter::from_data_sources(onchain_data_sources.iter())
+        };
+
+        let start_blocks = manifest.start_blocks();
+
+        let templates = Arc::new(manifest.templates.clone());
+
+        // Obtain the debug fork from the subgraph store
+        let debug_fork = self
+            .subgraph_store
+            .debug_fork(&deployment.hash, logger.clone())?;
 
         // Create a subgraph instance from the manifest; this moves
         // ownership of the manifest and host builder into the new instance
-        let instance = SubgraphInstance::from_manifest(&logger, manifest, &host_builder)?;
+        let stopwatch_metrics = StopwatchMetrics::new(
+            logger.clone(),
+            deployment.hash.clone(),
+            "process",
+            self.metrics_registry.clone(),
+        );
+
+        let unified_mapping_api_version = manifest.unified_mapping_api_version()?;
+        let triggers_adapter = chain.triggers_adapter(&deployment, &required_capabilities, unified_mapping_api_version).map_err(|e|
+                anyhow!(
+                "expected triggers adapter that matches deployment {} with required capabilities: {}: {}",
+                &deployment,
+                &required_capabilities, e))?.clone();
+
+        let host_metrics = Arc::new(HostMetrics::new(
+            registry.cheap_clone(),
+            deployment.hash.as_str(),
+            stopwatch_metrics.clone(),
+        ));
+
+        let subgraph_metrics = Arc::new(SubgraphInstanceMetrics::new(
+            registry.cheap_clone(),
+            deployment.hash.as_str(),
+            stopwatch_metrics.clone(),
+        ));
+
+        let block_stream_metrics = Arc::new(BlockStreamMetrics::new(
+            registry.cheap_clone(),
+            &deployment.hash,
+            manifest.network_name(),
+            store.shard().to_string(),
+            stopwatch_metrics,
+        ));
+
+        let mut offchain_monitor = OffchainMonitor::new(
+            logger.cheap_clone(),
+            registry.cheap_clone(),
+            &manifest.id,
+            self.ipfs_service.clone(),
+        );
+
+        // Initialize deployment_head with current deployment head. Any sort of trouble in
+        // getting the deployment head ptr leads to initializing with 0
+        let deployment_head = store.block_ptr().map(|ptr| ptr.number).unwrap_or(0) as f64;
+        block_stream_metrics.deployment_head.set(deployment_head);
+
+        let host_builder = graph_runtime_wasm::RuntimeHostBuilder::new(
+            chain.runtime_adapter(),
+            self.link_resolver.cheap_clone(),
+            subgraph_store.ens_lookup(),
+        );
+
+        let features = manifest.features.clone();
+        let unified_api_version = manifest.unified_mapping_api_version()?;
+        let poi_version = if manifest.spec_version.ge(&SPEC_VERSION_0_0_6) {
+            ProofOfIndexingVersion::Fast
+        } else {
+            ProofOfIndexingVersion::Legacy
+        };
+
+        let causality_region_seq =
+            CausalityRegionSeq::from_current(store.causality_region_curr_val().await?);
+
+        let instrument = self.subgraph_store.instrument(&deployment)?;
+        let instance = super::context::instance::SubgraphInstance::from_manifest(
+            &logger,
+            manifest,
+            host_builder,
+            host_metrics.clone(),
+            &mut offchain_monitor,
+            causality_region_seq,
+        )?;
+
+        let inputs = IndexingInputs {
+            deployment: deployment.clone(),
+            features,
+            start_blocks,
+            stop_block,
+            store,
+            debug_fork,
+            triggers_adapter,
+            chain,
+            templates,
+            unified_api_version,
+            static_filters,
+            poi_version,
+            network,
+            instrument,
+        };
 
         // The subgraph state tracks the state of the subgraph instance over time
-        let ctx = IndexingContext {
-            inputs: IndexingInputs {
-                deployment_id,
-                network_name,
-                store,
-                stream_builder,
-                host_builder,
-                templates_use_calls,
-                top_level_templates,
-            },
-            state: IndexingState {
-                logger,
-                instance,
-                instances,
-                log_filter,
-                call_filter,
-                block_filter,
-                restarts: 0,
-            },
+        let ctx = IndexingContext::new(
+            instance,
+            self.instances.cheap_clone(),
+            filter,
+            offchain_monitor,
+            tp,
+        );
+
+        let metrics = RunnerMetrics {
+            subgraph: subgraph_metrics,
+            host: host_metrics,
+            stream: block_stream_metrics,
         };
+
+        Ok(SubgraphRunner::new(
+            inputs,
+            ctx,
+            logger.cheap_clone(),
+            metrics,
+            env_vars,
+        ))
+    }
+
+    async fn start_subgraph_inner<C: Blockchain>(
+        &self,
+        logger: Logger,
+        deployment: DeploymentLocator,
+        runner: SubgraphRunner<C, RuntimeHostBuilder<C>>,
+    ) -> Result<(), Error>
+    where
+        <C as Blockchain>::MappingTrigger: ToAscPtr,
+    {
+        let registry = self.metrics_registry.cheap_clone();
+        let subgraph_metrics_unregister = runner.metrics.subgraph.cheap_clone();
 
         // Keep restarting the subgraph until it terminates. The subgraph
         // will usually only run once, but is restarted whenever a block
@@ -241,463 +474,24 @@ impl SubgraphInstanceManager {
         // block stream and include events for the new data sources going
         // forward; this is easier than updating the existing block stream.
         //
-        // This task has many calls to the store, so mark it as `blocking`.
-        tokio::spawn(graph::util::futures::blocking(loop_fn(ctx, |ctx| {
-            run_subgraph(ctx)
-        })));
+        // This is a long-running and unfortunately a blocking future (see #905), so it is run in
+        // its own thread. It is also run with `task::unconstrained` because we have seen deadlocks
+        // occur without it, possibly caused by our use of legacy futures and tokio versions in the
+        // codebase and dependencies, which may not play well with the tokio 1.0 cooperative
+        // scheduling. It is also logical in terms of performance to run this with `unconstrained`,
+        // it has a dedicated OS thread so the OS will handle the preemption. See
+        // https://github.com/tokio-rs/tokio/issues/3493.
+        graph::spawn_thread(deployment.to_string(), move || {
+            if let Err(e) = graph::block_on(task::unconstrained(runner.run())) {
+                error!(
+                    &logger,
+                    "Subgraph instance failed to run: {}",
+                    format!("{:#}", e)
+                );
+            }
+            subgraph_metrics_unregister.unregister(registry);
+        });
 
         Ok(())
     }
-
-    fn stop_subgraph(instances: SharedInstanceKeepAliveMap, id: SubgraphDeploymentId) {
-        // Drop the cancel guard to shut down the sujbgraph now
-        let mut instances = instances.write().unwrap();
-        instances.remove(&id);
-    }
-}
-
-impl EventConsumer<SubgraphAssignmentProviderEvent> for SubgraphInstanceManager {
-    /// Get the wrapped event sink.
-    fn event_sink(
-        &self,
-    ) -> Box<dyn Sink<SinkItem = SubgraphAssignmentProviderEvent, SinkError = ()> + Send> {
-        let logger = self.logger.clone();
-        Box::new(self.input.clone().sink_map_err(move |e| {
-            error!(logger, "Component was dropped: {}", e);
-        }))
-    }
-}
-
-fn run_subgraph<B, S, T>(
-    ctx: IndexingContext<B, S, T>,
-) -> impl Future<Item = Loop<(), IndexingContext<B, S, T>>, Error = ()>
-where
-    B: BlockStreamBuilder,
-    S: Store + ChainStore,
-    T: RuntimeHostBuilder,
-{
-    let logger = ctx.state.logger.clone();
-
-    debug!(logger, "Starting or restarting subgraph");
-
-    // Clone a few things for different parts of the async processing
-    let id_for_err = ctx.inputs.deployment_id.clone();
-    let store_for_err = ctx.inputs.store.clone();
-    let logger_for_err = logger.clone();
-    let logger_for_block_stream_errors = logger.clone();
-
-    let block_stream_canceler = CancelGuard::new();
-    let block_stream_cancel_handle = block_stream_canceler.handle();
-    let block_stream = ctx
-        .inputs
-        .stream_builder
-        .build(
-            logger.clone(),
-            ctx.inputs.deployment_id.clone(),
-            ctx.inputs.network_name.clone(),
-            ctx.state.log_filter.clone(),
-            ctx.state.call_filter.clone(),
-            ctx.state.block_filter.clone(),
-            ctx.inputs.templates_use_calls,
-        )
-        .from_err()
-        .cancelable(&block_stream_canceler, || CancelableError::Cancel);
-
-    // Keep the stream's cancel guard around to be able to shut it down
-    // when the subgraph deployment is unassigned
-    ctx.state
-        .instances
-        .write()
-        .unwrap()
-        .insert(ctx.inputs.deployment_id.clone(), block_stream_canceler);
-
-    debug!(logger, "Starting block stream");
-
-    // The processing stream may be end due to an error or for restarting to
-    // account for new data sources.
-    enum StreamEnd<B: BlockStreamBuilder, S: Store + ChainStore, T: RuntimeHostBuilder> {
-        Error(CancelableError<Error>),
-        NeedsRestart(IndexingContext<B, S, T>),
-    }
-
-    block_stream
-        // Log and drop the errors from the block_stream
-        // The block stream will continue attempting to produce blocks
-        .then(move |result| match result {
-            Ok(block) => Ok(Some(block)),
-            Err(e) => {
-                debug!(
-                    logger_for_block_stream_errors,
-                    "Block stream produced a non-fatal error";
-                    "error" => format!("{}", e),
-                );
-                Ok(None)
-            }
-        })
-        .filter_map(|block_opt| block_opt)
-        // Process blocks from the stream as long as no restart is needed
-        .fold(ctx, move |ctx, block| {
-            process_block(
-                logger.clone(),
-                ctx,
-                block_stream_cancel_handle.clone(),
-                block,
-            )
-            .map_err(|e| StreamEnd::Error(e))
-            .and_then(|(ctx, needs_restart)| match needs_restart {
-                false => Ok(ctx),
-                true => Err(StreamEnd::NeedsRestart(ctx)),
-            })
-        })
-        .then(move |res| match res {
-            Ok(_) => unreachable!("block stream finished without error"),
-            Err(StreamEnd::NeedsRestart(mut ctx)) => {
-                // Increase the restart counter
-                ctx.state.restarts += 1;
-
-                // Cancel the stream for real
-                ctx.state
-                    .instances
-                    .write()
-                    .unwrap()
-                    .remove(&ctx.inputs.deployment_id);
-
-                // And restart the subgraph
-                Ok(Loop::Continue(ctx))
-            }
-
-            Err(StreamEnd::Error(CancelableError::Cancel)) => {
-                debug!(
-                    logger_for_err,
-                    "Subgraph block stream shut down cleanly";
-                    "id" => id_for_err.to_string(),
-                );
-                Err(())
-            }
-
-            // Handle unexpected stream errors by marking the subgraph as failed.
-            Err(StreamEnd::Error(CancelableError::Error(e))) => {
-                error!(
-                    logger_for_err,
-                    "Subgraph instance failed to run: {}", e;
-                    "id" => id_for_err.to_string(),
-                    "code" => LogCode::SubgraphSyncingFailure
-                );
-
-                // Set subgraph status to Failed
-                let status_ops =
-                    SubgraphDeploymentEntity::update_failed_operations(&id_for_err, true);
-                if let Err(e) = store_for_err.apply_metadata_operations(status_ops) {
-                    error!(
-                        logger_for_err,
-                        "Failed to set subgraph status to Failed: {}", e;
-                        "id" => id_for_err.to_string(),
-                        "code" => LogCode::SubgraphSyncingFailureNotRecorded
-                    );
-                }
-                Err(())
-            }
-        })
-}
-
-/// Processes a block and returns the updated context and a boolean flag indicating
-/// whether new dynamic data sources have been added to the subgraph.
-fn process_block<B, S, T>(
-    logger: Logger,
-    ctx: IndexingContext<B, S, T>,
-    block_stream_cancel_handle: CancelHandle,
-    block: EthereumBlockWithTriggers,
-) -> impl Future<Item = (IndexingContext<B, S, T>, bool), Error = CancelableError<Error>>
-where
-    B: BlockStreamBuilder,
-    S: ChainStore + Store,
-    T: RuntimeHostBuilder,
-{
-    let calls = block.calls;
-    let triggers = block.triggers;
-    let block = block.ethereum_block;
-
-    let logger = logger.new(o!(
-        "block_number" => format!("{:?}", block.block.number.unwrap()),
-        "block_hash" => format!("{:?}", block.block.hash.unwrap())
-    ));
-    let logger1 = logger.clone();
-
-    if triggers.len() == 1 {
-        info!(logger, "1 trigger found in this block for this subgraph");
-    } else if triggers.len() > 1 {
-        info!(
-            logger,
-            "{} triggers found in this block for this subgraph",
-            triggers.len()
-        );
-    }
-
-    // Obtain current and new block pointer (after this block is processed)
-    let block = Arc::new(block);
-    let block_ptr_now = EthereumBlockPointer::to_parent(&block);
-    let block_ptr_after = EthereumBlockPointer::from(&*block);
-    let block_ptr_for_new_data_sources = block_ptr_after.clone();
-
-    // Process events one after the other, passing in entity operations
-    // collected previously to every new event being processed
-    process_triggers(
-        logger.clone(),
-        ctx,
-        BlockState::default(),
-        block.clone(),
-        triggers,
-    )
-    .and_then(move |(ctx, block_state)| {
-        // If new data sources have been created, restart the subgraph after this block.
-        let needs_restart = !block_state.created_data_sources.is_empty();
-
-        // This loop will:
-        // 1. Instantiate created data sources.
-        // 2. Process those data sources for the current block.
-        // Until no data sources are created or MAX_DATA_SOURCES is hit.
-
-        // Note that this algorithm processes data sources spawned on the same block _breadth
-        // first_ on the tree implied by the parent-child relationship between data sources. Only a
-        // very contrived subgraph would be able to observe this.
-        loop_fn(
-            (ctx, block_state),
-            move |(mut ctx, mut block_state)| -> Box<dyn Future<Item = _, Error = _> + Send> {
-                if block_state.created_data_sources.is_empty() {
-                    // No new data sources, nothing to do.
-                    return Box::new(future::ok(Loop::Break((ctx, block_state))));
-                }
-
-                // Instantiate dynamic data sources, removing them from the block state.
-                let (data_sources, runtime_hosts) = match create_dynamic_data_sources(
-                    logger.clone(),
-                    &ctx.inputs,
-                    block_state.created_data_sources.drain(..),
-                ) {
-                    Ok(ok) => ok,
-                    Err(err) => return Box::new(future::err(err.into())),
-                };
-
-                // Reprocess the triggers from this block that match the new data sources
-
-                let block_with_calls = EthereumBlockWithCalls {
-                    ethereum_block: block.deref().clone(),
-                    calls: calls.clone(),
-                };
-
-                let block_with_triggers = match <B>::Stream::parse_triggers(
-                    EthereumLogFilter::from_data_sources(data_sources.iter()),
-                    EthereumCallFilter::from_data_sources(data_sources.iter()),
-                    EthereumBlockFilter::from_data_sources(data_sources.iter()),
-                    false,
-                    block_with_calls,
-                ) {
-                    Ok(block_with_triggers) => block_with_triggers,
-                    Err(err) => return Box::new(future::err(err.into())),
-                };
-                let triggers = block_with_triggers.triggers;
-
-                if triggers.len() == 1 {
-                    info!(
-                        logger,
-                        "1 trigger found in this block for the new data sources"
-                    );
-                } else if triggers.len() > 1 {
-                    info!(
-                        logger,
-                        "{} triggers found in this block for the new data sources",
-                        triggers.len()
-                    );
-                }
-
-                // Add entity operations for the new data sources to the block state
-                // and add runtimes for the data sources to the subgraph instance.
-                if let Err(err) = persist_dynamic_data_sources(
-                    logger.clone(),
-                    &mut ctx,
-                    &mut block_state.entity_cache,
-                    data_sources,
-                    runtime_hosts.clone(),
-                    block_ptr_for_new_data_sources,
-                ) {
-                    return Box::new(future::err(err.into()));
-                }
-
-                let logger = logger.clone();
-                let block = block.clone();
-                Box::new(
-                    stream::iter_ok(triggers)
-                        .fold(block_state, move |block_state, trigger| {
-                            // Process the triggers in each host in the same order the
-                            // corresponding data sources have been created.
-                            SubgraphInstance::<T>::process_trigger_in_runtime_hosts(
-                                &logger,
-                                runtime_hosts.iter().cloned(),
-                                block.clone(),
-                                trigger,
-                                block_state,
-                            )
-                        })
-                        .and_then(|block_state| future::ok(Loop::Continue((ctx, block_state)))),
-                )
-            },
-        )
-        .map(move |(ctx, block_state)| (ctx, block_state, needs_restart))
-    })
-    // Apply entity operations and advance the stream
-    .and_then(move |(ctx, block_state, needs_restart)| {
-        // Avoid writing to store if block stream has been canceled
-        if block_stream_cancel_handle.is_canceled() {
-            return Err(CancelableError::Cancel);
-        }
-
-        let mods = block_state
-            .entity_cache
-            .as_modifications(ctx.inputs.store.as_ref())
-            .map_err(|e| {
-                CancelableError::from(format_err!(
-                    "Error while processing block stream for a subgraph: {}",
-                    e
-                ))
-            })?;
-        if !mods.is_empty() {
-            info!(logger1, "Applying {} entity operation(s)", mods.len());
-        }
-
-        // Transact entity operations into the store and update the
-        // subgraph's block stream pointer
-        ctx.inputs
-            .store
-            .transact_block_operations(
-                ctx.inputs.deployment_id.clone(),
-                block_ptr_now,
-                block_ptr_after,
-                mods,
-            )
-            .map(|should_migrate| {
-                if should_migrate {
-                    ctx.inputs.store.migrate_subgraph_deployment(
-                        &logger1,
-                        &ctx.inputs.deployment_id,
-                        &block_ptr_after,
-                    );
-                }
-                (ctx, needs_restart)
-            })
-            .map_err(|e| {
-                format_err!("Error while processing block stream for a subgraph: {}", e).into()
-            })
-    })
-}
-
-fn process_triggers<B, S, T>(
-    logger: Logger,
-    ctx: IndexingContext<B, S, T>,
-    block_state: BlockState,
-    block: Arc<EthereumBlock>,
-    triggers: Vec<EthereumTrigger>,
-) -> impl Future<Item = (IndexingContext<B, S, T>, BlockState), Error = CancelableError<Error>>
-where
-    B: BlockStreamBuilder,
-    S: ChainStore + Store,
-    T: RuntimeHostBuilder,
-{
-    stream::iter_ok::<_, CancelableError<Error>>(triggers)
-        // Process events from the block stream
-        .fold((ctx, block_state), move |(ctx, block_state), trigger| {
-            let logger = logger.clone();
-            let block = block.clone();
-
-            ctx.state
-                .instance
-                .process_trigger(&logger, block, trigger, block_state)
-                .map(|block_state| (ctx, block_state))
-                .map_err(|e| format_err!("Failed to process trigger: {}", e))
-        })
-}
-
-fn create_dynamic_data_sources<B, S, T>(
-    logger: Logger,
-    inputs: &IndexingInputs<B, S, T>,
-    created_data_sources: impl Iterator<Item = DataSourceTemplateInfo>,
-) -> Result<(Vec<DataSource>, Vec<Arc<T::Host>>), Error>
-where
-    B: BlockStreamBuilder,
-    S: ChainStore + Store,
-    T: RuntimeHostBuilder,
-{
-    let mut data_sources = vec![];
-    let mut runtime_hosts = vec![];
-
-    for info in created_data_sources {
-        // Try to instantiate a data source from the template
-        let data_source = DataSource::try_from_template(info.template, &info.params)?;
-
-        // Try to create a runtime host for the data source
-        let host = inputs.host_builder.build(
-            &logger,
-            inputs.network_name.clone(),
-            inputs.deployment_id.clone(),
-            data_source.clone(),
-            inputs.top_level_templates.clone(),
-        )?;
-
-        data_sources.push(data_source);
-        runtime_hosts.push(Arc::new(host));
-    }
-
-    Ok((data_sources, runtime_hosts))
-}
-
-fn persist_dynamic_data_sources<B, S, T>(
-    logger: Logger,
-    ctx: &mut IndexingContext<B, S, T>,
-    entity_cache: &mut EntityCache,
-    data_sources: Vec<DataSource>,
-    runtime_hosts: Vec<Arc<T::Host>>,
-    block_ptr: EthereumBlockPointer,
-) -> Result<(), Error>
-where
-    B: BlockStreamBuilder,
-    S: ChainStore + Store,
-    T: RuntimeHostBuilder,
-{
-    if !data_sources.is_empty() {
-        debug!(
-            logger,
-            "Creating {} dynamic data source(s)",
-            data_sources.len()
-        );
-    }
-
-    // Add entity operations to the block state in order to persist
-    // the dynamic data sources
-    for data_source in data_sources.iter() {
-        let entity = DynamicEthereumContractDataSourceEntity::from((
-            &ctx.inputs.deployment_id,
-            data_source,
-            &block_ptr,
-        ));
-        let id = format!("{}-dynamic", Uuid::new_v4().to_simple());
-        let operations = entity.write_entity_operations(id.as_ref());
-        entity_cache.append(operations);
-    }
-
-    // Merge log filters from data sources into the block stream builder
-    ctx.state
-        .log_filter
-        .extend(EthereumLogFilter::from_data_sources(&data_sources));
-
-    // Merge call filters from data sources into the block stream builder
-    ctx.state
-        .call_filter
-        .extend(EthereumCallFilter::from_data_sources(&data_sources));
-
-    // Merge block filters from data sources into the block stream builder
-    ctx.state
-        .block_filter
-        .extend(EthereumBlockFilter::from_data_sources(&data_sources));
-
-    // Add the new data sources to the subgraph instance
-    ctx.state.instance.add_dynamic_data_sources(runtime_hosts)
 }

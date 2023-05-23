@@ -1,16 +1,19 @@
 [package]
 name = "graph-graphql"
-version = "0.15.1"
-edition = "2018"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
+crossbeam = "0.8"
 graph = { path = "../graph" }
-graphql-parser = "0.2.3"
-indexmap = "1.2"
+graphql-parser = "0.4.0"
+graphql-tools = "0.2.1"
+indexmap = "1.9"
 Inflector = "0.11.3"
 lazy_static = "1.2.0"
-uuid = { version = "0.7.4", features = ["v4"] }
-
-[dev-dependencies]
-pretty_assertions = "0.6.1"
-test-store = { path = "../store/test-store" }
+stable-hash_legacy = { version = "0.3.3", package = "stable-hash" }
+stable-hash = { version = "0.4.2" }
+defer = "0.1"
+parking_lot = "0.12"
+anyhow = "1.0"
+async-recursion = "1.0.4"

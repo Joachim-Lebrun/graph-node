@@ -1,32 +1,35 @@
-dist: trusty
+dist: bionic
 language: rust
+# This line would cache cargo-audit once installed,
+# but instead will fail from the 10 minute timeout after
+# printing the line "creating directory /home/travis/.cache/sccache"
+#cache: cargo
 rust:
   - stable
   - beta
-  - nightly
 
 # Select pre-installed services
 addons:
   postgresql: "10"
   apt:
     packages:
-    - postgresql-10
-    - postgresql-client-10
+      - postgresql-10
+      - postgresql-client-10
 services:
   - postgresql
+  - docker
 
 before_install:
+  # Install Node.js 11.x
+  - nvm install 11 && nvm use 11
   # Install IPFS
-  - wget "https://dist.ipfs.io/go-ipfs/v0.4.17/go-ipfs_v0.4.17_linux-amd64.tar.gz" -O /tmp/ipfs.tar.gz
+  - wget "https://dist.ipfs.io/go-ipfs/v0.10.0/go-ipfs_v0.10.0_linux-amd64.tar.gz" -O /tmp/ipfs.tar.gz
   - pushd . && cd $HOME/bin && tar -xzvf /tmp/ipfs.tar.gz && popd
   - export PATH="$HOME/bin/go-ipfs:$PATH"
   - ipfs init
-  - ipfs daemon &> /dev/null &
 
 matrix:
   fast_finish: true
-  allow_failures:
-    - rust: nightly
   include:
     # Some env var is always necessary to differentiate included builds
     # Check coding style
@@ -36,23 +39,31 @@ matrix:
         - rustup component add rustfmt
         - cargo fmt --all -- --check
 
+    # Make sure release builds compile
+    - env: CHECK_RELEASE=true
+      rust: stable
+      script:
+        - cargo check --release
+
     # Check for warnings
     - env: RUSTFLAGS="-D warnings"
       rust: stable
       script:
         - cargo check --tests
 
-  # Build tagged commits in release mode
+    # Build tagged commits in release mode
     - env: RELEASE=true
       if: tag IS present
       script:
-          - cargo build -p graph-node --release
-          - mv target/release/graph-node target/release/graph-node-$TRAVIS_OS_NAME
+        - cargo build -p graph-node --release
+        - mv target/release/graph-node target/release/graph-node-$TRAVIS_OS_NAME
 
 env:
   global:
-  - PGPORT=5433
-  - THEGRAPH_STORE_POSTGRES_DIESEL_URL=postgresql://travis:travis@localhost:5433/graph_node_test
+    - PGPORT=5432
+    - THEGRAPH_STORE_POSTGRES_DIESEL_URL=postgresql://travis:travis@localhost:5432/graph_node_test
+    # Added because https://nodejs.org/dist/ had issues
+    - NVM_NODEJS_ORG_MIRROR=https://cnpmjs.org/mirrors/node/
 
 # Test pipeline
 before_script:
@@ -61,11 +72,9 @@ before_script:
 
 script:
   # Run tests
+  - ipfs daemon &> /dev/null &
   - RUST_BACKTRACE=1 cargo test --verbose --all -- --nocapture
-  # Run tests again against relational schema
-  - psql -c 'drop database graph_node_test;' -U travis
-  - psql -c 'create database graph_node_test;' -U travis
-  - RUST_BACKTRACE=1 RELATIONAL_SCHEMA=on cargo test --verbose --all -- --nocapture
+  - killall ipfs
 
 deploy:
   provider: releases

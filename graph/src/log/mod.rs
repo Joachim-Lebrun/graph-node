@@ -1,9 +1,30 @@
+#[macro_export]
+macro_rules! impl_slog_value {
+    ($T:ty) => {
+        impl_slog_value!($T, "{}");
+    };
+    ($T:ty, $fmt:expr) => {
+        impl $crate::slog::Value for $T {
+            fn serialize(
+                &self,
+                record: &$crate::slog::Record,
+                key: $crate::slog::Key,
+                serializer: &mut dyn $crate::slog::Serializer,
+            ) -> $crate::slog::Result {
+                format!($fmt, self).serialize(record, key, serializer)
+            }
+        }
+    };
+}
+
 use isatty;
 use slog::*;
 use slog_async;
 use slog_envlogger;
 use slog_term::*;
-use std::{env, fmt, io, result};
+use std::{fmt, io, result};
+
+use crate::prelude::ENV_VARS;
 
 pub mod codes;
 pub mod elastic;
@@ -11,6 +32,10 @@ pub mod factory;
 pub mod split;
 
 pub fn logger(show_debug: bool) -> Logger {
+    logger_with_levels(show_debug, ENV_VARS.log_levels.as_deref())
+}
+
+pub fn logger_with_levels(show_debug: bool, levels: Option<&str>) -> Logger {
     let use_color = isatty::stdout_isatty();
     let decorator = slog_term::TermDecorator::new().build();
     let drain = CustomFormat::new(decorator, use_color).fuse();
@@ -23,15 +48,17 @@ pub fn logger(show_debug: bool) -> Logger {
                 FilterLevel::Info
             },
         )
-        .parse(
-            env::var_os("GRAPH_LOG")
-                .unwrap_or_else(|| "".into())
-                .to_str()
-                .unwrap(),
-        )
+        .parse(levels.unwrap_or(""))
         .build();
-    let drain = slog_async::Async::new(drain).chan_size(1000).build().fuse();
+    let drain = slog_async::Async::new(drain)
+        .chan_size(20000)
+        .build()
+        .fuse();
     Logger::root(drain, o!())
+}
+
+pub fn discard() -> Logger {
+    Logger::root(slog::Discard, o!())
 }
 
 pub struct CustomFormat<D>
@@ -68,8 +95,7 @@ where
     fn format_custom(&self, record: &Record, values: &OwnedKVList) -> io::Result<()> {
         self.decorator.with_record(record, values, |mut decorator| {
             decorator.start_timestamp()?;
-            timestamp_local(&mut decorator)?;
-
+            formatted_timestamp_local(&mut decorator)?;
             decorator.start_whitespace()?;
             write!(decorator, " ")?;
 
@@ -80,7 +106,9 @@ where
             write!(decorator, " ")?;
 
             decorator.start_msg()?;
-            write!(decorator, "{}", record.msg())?;
+            // Escape control characters in the message, including newlines.
+            let msg = escape_control_chars(record.msg().to_string());
+            write!(decorator, "{}", msg)?;
 
             // Collect key values from the record
             let mut serializer = KeyValueSerializer::new();
@@ -124,7 +152,7 @@ where
             }
 
             // Then log the component hierarchy
-            if components.len() > 0 {
+            if !components.is_empty() {
                 decorator.start_comma()?;
                 write!(decorator, ", ")?;
                 decorator.start_key()?;
@@ -143,7 +171,7 @@ where
                 }
             }
 
-            write!(decorator, "\n")?;
+            writeln!(decorator)?;
             decorator.flush()?;
 
             Ok(())
@@ -166,7 +194,7 @@ impl HeaderSerializer {
         }
     }
 
-    pub fn finish(mut self) -> ((Option<String>, Vec<String>, Vec<(String, String)>)) {
+    pub fn finish(mut self) -> (Option<String>, Vec<String>, Vec<(String, String)>) {
         // Reverse components so the parent components come first
         self.components.reverse();
 
@@ -349,5 +377,57 @@ impl ser::Serializer for KeyValueSerializer {
 
     fn emit_arguments(&mut self, key: Key, val: &fmt::Arguments) -> slog::Result {
         s!(self, key, val)
+    }
+}
+
+fn formatted_timestamp_local(io: &mut impl io::Write) -> io::Result<()> {
+    write!(
+        io,
+        "{}",
+        chrono::Local::now().format(ENV_VARS.log_time_format.as_str())
+    )
+}
+
+pub fn escape_control_chars(input: String) -> String {
+    let should_escape = |c: char| c.is_control() && c != '\t';
+
+    if !input.chars().any(should_escape) {
+        return input;
+    }
+
+    let mut escaped = String::new();
+    for c in input.chars() {
+        match c {
+            '\n' => escaped.push_str("\\n"),
+            c if should_escape(c) => {
+                let code = c as u32;
+                escaped.push_str(&format!("\\u{{{:04x}}}", code));
+            }
+            _ => escaped.push(c),
+        }
+    }
+    escaped
+}
+
+#[test]
+fn test_escape_control_chars() {
+    let test_cases = vec![
+        (
+            "This is a test\nwith some\tcontrol characters\x1B[1;32m and others.",
+            "This is a test\\nwith some\tcontrol characters\\u{001b}[1;32m and others.",
+        ),
+        (
+            "This string has no control characters.",
+            "This string has no control characters.",
+        ),
+        (
+            "This string has a tab\tbut no other control characters.",
+            "This string has a tab\tbut no other control characters.",
+        ),
+    ];
+
+    for (input, expected) in test_cases {
+        let escaped = escape_control_chars(input.to_string());
+        assert_eq!(escaped, expected);
     }
 }

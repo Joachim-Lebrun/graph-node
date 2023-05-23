@@ -1,4 +1,8 @@
-use crate::prelude::*;
+use std::str::FromStr;
+
+use async_trait::async_trait;
+
+use crate::{components::store::DeploymentLocator, prelude::*};
 
 #[derive(Clone, Copy, Debug)]
 pub enum SubgraphVersionSwitchingMode {
@@ -8,36 +12,46 @@ pub enum SubgraphVersionSwitchingMode {
 
 impl SubgraphVersionSwitchingMode {
     pub fn parse(mode: &str) -> Self {
-        match mode.to_ascii_lowercase().as_str() {
-            "instant" => SubgraphVersionSwitchingMode::Instant,
-            "synced" => SubgraphVersionSwitchingMode::Synced,
-            _ => panic!("invalid version switching mode: {:?}", mode),
+        Self::from_str(mode).unwrap()
+    }
+}
+
+impl FromStr for SubgraphVersionSwitchingMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "instant" => Ok(SubgraphVersionSwitchingMode::Instant),
+            "synced" => Ok(SubgraphVersionSwitchingMode::Synced),
+            _ => Err(format!("invalid version switching mode: {:?}", s)),
         }
     }
 }
 
-/// Common trait for named subgraph providers.
+/// Common trait for subgraph registrars.
+#[async_trait]
 pub trait SubgraphRegistrar: Send + Sync + 'static {
-    fn create_subgraph(
+    async fn create_subgraph(
         &self,
         name: SubgraphName,
-    ) -> Box<dyn Future<Item = CreateSubgraphResult, Error = SubgraphRegistrarError> + Send + 'static>;
+    ) -> Result<CreateSubgraphResult, SubgraphRegistrarError>;
 
-    fn create_subgraph_version(
+    async fn create_subgraph_version(
         &self,
         name: SubgraphName,
-        hash: SubgraphDeploymentId,
+        hash: DeploymentHash,
         assignment_node_id: NodeId,
-    ) -> Box<dyn Future<Item = (), Error = SubgraphRegistrarError> + Send + 'static>;
+        debug_fork: Option<DeploymentHash>,
+        start_block_block: Option<BlockPtr>,
+        graft_block_override: Option<BlockPtr>,
+        history_blocks: Option<i32>,
+    ) -> Result<DeploymentLocator, SubgraphRegistrarError>;
 
-    fn remove_subgraph(
-        &self,
-        name: SubgraphName,
-    ) -> Box<dyn Future<Item = (), Error = SubgraphRegistrarError> + Send + 'static>;
+    async fn remove_subgraph(&self, name: SubgraphName) -> Result<(), SubgraphRegistrarError>;
 
-    fn reassign_subgraph(
+    async fn reassign_subgraph(
         &self,
-        hash: SubgraphDeploymentId,
-        node_id: NodeId,
-    ) -> Box<dyn Future<Item = (), Error = SubgraphRegistrarError> + Send + 'static>;
+        hash: &DeploymentHash,
+        node_id: &NodeId,
+    ) -> Result<(), SubgraphRegistrarError>;
 }

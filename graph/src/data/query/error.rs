@@ -1,23 +1,31 @@
-use failure;
-use graphql_parser::{query as q, Pos};
+use graphql_parser::Pos;
 use hex::FromHexError;
-use num_bigint;
 use serde::ser::*;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
 use std::string::FromUtf8Error;
+use std::sync::Arc;
 
-use crate::components::store::StoreError;
 use crate::data::subgraph::*;
+use crate::prelude::q;
+use crate::{components::store::StoreError, prelude::CacheWeight};
+
+#[derive(Debug, Clone)]
+pub struct CloneableAnyhowError(Arc<anyhow::Error>);
+
+impl From<anyhow::Error> for CloneableAnyhowError {
+    fn from(f: anyhow::Error) -> Self {
+        Self(Arc::new(f))
+    }
+}
 
 /// Error caused while executing a [Query](struct.Query.html).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum QueryExecutionError {
     OperationNameRequired,
     OperationNotFound(String),
     NotSupported(String),
-    NoRootQueryObjectType,
     NoRootSubscriptionObjectType,
     NonNullError(Pos, String),
     ListValueError(Pos, String),
@@ -25,9 +33,9 @@ pub enum QueryExecutionError {
     AbstractTypeError(String),
     InvalidArgumentError(Pos, String, q::Value),
     MissingArgumentError(Pos, String),
+    ValidationError(Option<Pos>, String),
     InvalidVariableTypeError(Pos, String),
     MissingVariableError(Pos, String),
-    ResolveEntityError(SubgraphDeploymentId, String, String, String),
     ResolveEntitiesError(String),
     OrderByNotSupportedError(String, String),
     OrderByNotSupportedForType(String),
@@ -36,7 +44,7 @@ pub enum QueryExecutionError {
     EmptyQuery,
     MultipleSubscriptionFields,
     SubgraphDeploymentIdError(String),
-    RangeArgumentsError(Vec<&'static str>, u32),
+    RangeArgumentsError(&'static str, u32, i64),
     InvalidFilterError,
     EntityFieldError(String, String),
     ListTypesError(String, Vec<String>),
@@ -44,7 +52,7 @@ pub enum QueryExecutionError {
     ValueParseError(String, String),
     AttributeTypeError(String, String),
     EntityParseError(String),
-    StoreError(failure::Error),
+    StoreError(CloneableAnyhowError),
     Timeout,
     EmptySelectionSet(String),
     AmbiguousDerivedFromResult(Pos, String, String, String),
@@ -53,6 +61,78 @@ pub enum QueryExecutionError {
     ScalarCoercionError(Pos, String, q::Value, String),
     TooComplex(u64, u64), // (complexity, max_complexity)
     TooDeep(u8),          // max_depth
+    CyclicalFragment(String),
+    TooExpensive,
+    Throttled,
+    UndefinedFragment(String),
+    Panic(String),
+    EventStreamError,
+    FulltextQueryRequiresFilter,
+    FulltextQueryInvalidSyntax(String),
+    DeploymentReverted,
+    SubgraphManifestResolveError(Arc<SubgraphManifestResolveError>),
+    InvalidSubgraphManifest,
+    ResultTooBig(usize, usize),
+    DeploymentNotFound(String),
+}
+
+impl QueryExecutionError {
+    pub fn is_attestable(&self) -> bool {
+        use self::QueryExecutionError::*;
+        match self {
+            OperationNameRequired
+            | OperationNotFound(_)
+            | NotSupported(_)
+            | NoRootSubscriptionObjectType
+            | NonNullError(_, _)
+            | NamedTypeError(_)
+            | AbstractTypeError(_)
+            | InvalidArgumentError(_, _, _)
+            | MissingArgumentError(_, _)
+            | InvalidVariableTypeError(_, _)
+            | MissingVariableError(_, _)
+            | OrderByNotSupportedError(_, _)
+            | OrderByNotSupportedForType(_)
+            | FilterNotSupportedError(_, _)
+            | UnknownField(_, _, _)
+            | EmptyQuery
+            | MultipleSubscriptionFields
+            | SubgraphDeploymentIdError(_)
+            | InvalidFilterError
+            | EntityFieldError(_, _)
+            | ListTypesError(_, _)
+            | ListFilterError(_)
+            | ValueParseError(_, _)
+            | AttributeTypeError(_, _)
+            | EmptySelectionSet(_)
+            | Unimplemented(_)
+            | EnumCoercionError(_, _, _, _, _)
+            | ScalarCoercionError(_, _, _, _)
+            | CyclicalFragment(_)
+            | UndefinedFragment(_)
+            | FulltextQueryInvalidSyntax(_)
+            | FulltextQueryRequiresFilter => true,
+            ListValueError(_, _)
+            | ResolveEntitiesError(_)
+            | RangeArgumentsError(_, _, _)
+            | EntityParseError(_)
+            | StoreError(_)
+            | Timeout
+            | AmbiguousDerivedFromResult(_, _, _, _)
+            | TooComplex(_, _)
+            | TooDeep(_)
+            | Panic(_)
+            | EventStreamError
+            | TooExpensive
+            | Throttled
+            | DeploymentReverted
+            | SubgraphManifestResolveError(_)
+            | InvalidSubgraphManifest
+            | ValidationError(_, _)
+            | ResultTooBig(_, _)
+            | DeploymentNotFound(_) => false,
+        }
+    }
 }
 
 impl Error for QueryExecutionError {
@@ -74,10 +154,10 @@ impl fmt::Display for QueryExecutionError {
             OperationNotFound(s) => {
                 write!(f, "Operation name not found `{}`", s)
             }
-            NotSupported(s) => write!(f, "Not supported: {}", s),
-            NoRootQueryObjectType => {
-                write!(f, "No root Query type defined in the schema")
+            ValidationError(_pos, message) => {
+                write!(f, "{}", message)
             }
+            NotSupported(s) => write!(f, "Not supported: {}", s),
             NoRootSubscriptionObjectType => {
                 write!(f, "No root Subscription type defined in the schema")
             }
@@ -105,9 +185,6 @@ impl fmt::Display for QueryExecutionError {
             MissingVariableError(_, s) => {
                 write!(f, "No value provided for required variable `{}`", s)
             }
-            ResolveEntityError(_, entity, id, e) => {
-                write!(f, "Failed to get `{}` entity with ID `{}` from store: {}", entity, id, e)
-            }
             ResolveEntitiesError(e) => {
                 write!(f, "Failed to get entities from store: {}", e)
             }
@@ -131,15 +208,8 @@ impl fmt::Display for QueryExecutionError {
             SubgraphDeploymentIdError(s) => {
                 write!(f, "Failed to get subgraph ID from type: `{}`", s)
             }
-            RangeArgumentsError(args, first_limit) => {
-                let msg = args.into_iter().map(|arg| {
-                    match *arg {
-                        "first" => format!("Value of \"first\" must be between 1 and {}", first_limit),
-                        "skip" => format!("Value of \"skip\" must be greater than 0"),
-                        _ => format!("Value of \"{}\" is must be an integer", arg),
-                    }
-                }).collect::<Vec<_>>().join(", ");
-                write!(f, "{}", msg)
+            RangeArgumentsError(arg, max, actual) => {
+                write!(f, "The `{}` argument must be between 0 and {}, but is {}", arg, max, actual)
             }
             InvalidFilterError => write!(f, "Filter must by an object"),
             EntityFieldError(e, a) => {
@@ -165,7 +235,7 @@ impl fmt::Display for QueryExecutionError {
                 write!(f, "Broken entity found in store: {}", s)
             }
             StoreError(e) => {
-                write!(f, "Store error: {}", e)
+                write!(f, "Store error: {}", e.0)
             }
             Timeout => write!(f, "Query timed out"),
             EmptySelectionSet(entity_type) => {
@@ -191,7 +261,20 @@ impl fmt::Display for QueryExecutionError {
                            of the query, querying fewer relationships or using `first` to \
                            return smaller collections", complexity, max_complexity)
             }
-            TooDeep(max_depth) => write!(f, "query has a depth that exceeds the limit of `{}`", max_depth)
+            TooDeep(max_depth) => write!(f, "query has a depth that exceeds the limit of `{}`", max_depth),
+            CyclicalFragment(name) =>write!(f, "query has fragment cycle including `{}`", name),
+            UndefinedFragment(frag_name) => write!(f, "fragment `{}` is not defined", frag_name),
+            Panic(msg) => write!(f, "panic processing query: {}", msg),
+            EventStreamError => write!(f, "error in the subscription event stream"),
+            FulltextQueryRequiresFilter => write!(f, "fulltext search queries can only use EntityFilter::Equal"),
+            FulltextQueryInvalidSyntax(msg) => write!(f, "Invalid fulltext search query syntax. Error: {}. Hint: Search terms with spaces need to be enclosed in single quotes", msg),
+            TooExpensive => write!(f, "query is too expensive"),
+            Throttled => write!(f, "service is overloaded and can not run the query right now. Please try again in a few minutes"),
+            DeploymentReverted => write!(f, "the chain was reorganized while executing the query"),
+            SubgraphManifestResolveError(e) => write!(f, "failed to resolve subgraph manifest: {}", e),
+            InvalidSubgraphManifest => write!(f, "invalid subgraph manifest file"),
+            ResultTooBig(actual, limit) => write!(f, "the result size of {} is larger than the allowed limit of {}", actual, limit),
+            DeploymentNotFound(id_or_name) => write!(f, "deployment `{}` does not exist", id_or_name)
         }
     }
 }
@@ -204,13 +287,7 @@ impl From<QueryExecutionError> for Vec<QueryExecutionError> {
 
 impl From<FromHexError> for QueryExecutionError {
     fn from(e: FromHexError) -> Self {
-        QueryExecutionError::ValueParseError("Bytes".to_string(), e.description().to_string())
-    }
-}
-
-impl From<num_bigint::ParseBigIntError> for QueryExecutionError {
-    fn from(e: num_bigint::ParseBigIntError) -> Self {
-        QueryExecutionError::ValueParseError("BigInt".to_string(), format!("{}", e))
+        QueryExecutionError::ValueParseError("Bytes".to_string(), e.to_string())
     }
 }
 
@@ -222,27 +299,43 @@ impl From<bigdecimal::ParseBigDecimalError> for QueryExecutionError {
 
 impl From<StoreError> for QueryExecutionError {
     fn from(e: StoreError) -> Self {
-        QueryExecutionError::StoreError(e.into())
+        match e {
+            StoreError::DeploymentNotFound(id_or_name) => {
+                QueryExecutionError::DeploymentNotFound(id_or_name)
+            }
+            _ => QueryExecutionError::StoreError(CloneableAnyhowError(Arc::new(e.into()))),
+        }
+    }
+}
+
+impl From<SubgraphManifestResolveError> for QueryExecutionError {
+    fn from(e: SubgraphManifestResolveError) -> Self {
+        QueryExecutionError::SubgraphManifestResolveError(Arc::new(e))
     }
 }
 
 /// Error caused while processing a [Query](struct.Query.html) request.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum QueryError {
     EncodingError(FromUtf8Error),
-    ParseError(q::ParseError),
+    ParseError(Arc<anyhow::Error>),
     ExecutionError(QueryExecutionError),
+    IndexingError,
+}
+
+impl QueryError {
+    pub fn is_attestable(&self) -> bool {
+        match self {
+            QueryError::EncodingError(_) | QueryError::ParseError(_) => true,
+            QueryError::ExecutionError(err) => err.is_attestable(),
+            QueryError::IndexingError => false,
+        }
+    }
 }
 
 impl From<FromUtf8Error> for QueryError {
     fn from(e: FromUtf8Error) -> Self {
         QueryError::EncodingError(e)
-    }
-}
-
-impl From<q::ParseError> for QueryError {
-    fn from(e: q::ParseError) -> Self {
-        QueryError::ParseError(e)
     }
 }
 
@@ -272,6 +365,9 @@ impl fmt::Display for QueryError {
             QueryError::EncodingError(ref e) => write!(f, "{}", e),
             QueryError::ExecutionError(ref e) => write!(f, "{}", e),
             QueryError::ParseError(ref e) => write!(f, "{}", e),
+
+            // This error message is part of attestable responses.
+            QueryError::IndexingError => write!(f, "indexing_error"),
         }
     }
 }
@@ -331,7 +427,8 @@ impl Serialize for QueryError {
             | QueryError::ExecutionError(MissingVariableError(pos, _))
             | QueryError::ExecutionError(AmbiguousDerivedFromResult(pos, _, _, _))
             | QueryError::ExecutionError(EnumCoercionError(pos, _, _, _, _))
-            | QueryError::ExecutionError(ScalarCoercionError(pos, _, _, _)) => {
+            | QueryError::ExecutionError(ScalarCoercionError(pos, _, _, _))
+            | QueryError::ExecutionError(UnknownField(pos, _, _)) => {
                 let mut location = HashMap::new();
                 location.insert("line", pos.line);
                 location.insert("column", pos.column);
@@ -343,5 +440,12 @@ impl Serialize for QueryError {
 
         map.serialize_entry("message", msg.as_str())?;
         map.end()
+    }
+}
+
+impl CacheWeight for QueryError {
+    fn indirect_weight(&self) -> usize {
+        // Errors don't have a weight since they are never cached
+        0
     }
 }

@@ -1,16 +1,17 @@
-use crate::prelude::*;
+use async_trait::async_trait;
+
+use crate::{components::store::DeploymentLocator, prelude::*};
 
 /// Common trait for subgraph providers.
-pub trait SubgraphAssignmentProvider:
-    EventProducer<SubgraphAssignmentProviderEvent> + Send + Sync + 'static
-{
-    fn start(
+#[async_trait]
+pub trait SubgraphAssignmentProvider: Send + Sync + 'static {
+    async fn start(
         &self,
-        id: SubgraphDeploymentId,
-    ) -> Box<dyn Future<Item = (), Error = SubgraphAssignmentProviderError> + Send + 'static>;
-
-    fn stop(
+        deployment: DeploymentLocator,
+        stop_block: Option<BlockNumber>,
+    ) -> Result<(), SubgraphAssignmentProviderError>;
+    async fn stop(
         &self,
-        id: SubgraphDeploymentId,
-    ) -> Box<dyn Future<Item = (), Error = SubgraphAssignmentProviderError> + Send + 'static>;
+        deployment: DeploymentLocator,
+    ) -> Result<(), SubgraphAssignmentProviderError>;
 }

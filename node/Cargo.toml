@@ -1,33 +1,46 @@
 [package]
 name = "graph-node"
-version = "0.15.1"
-edition = "2018"
+version.workspace = true
+edition.workspace = true
+default-run = "graph-node"
+
+[[bin]]
+name = "graph-node"
+path = "src/main.rs"
+
+[[bin]]
+name = "graphman"
+path = "src/bin/manager.rs"
 
 [dependencies]
-clap = "2.33.0"
-env_logger = "0.6.2"
-futures = "0.1.21"
-git-testament = "0.1"
-graphql-parser = "0.2.3"
-http = "0.1"
-
-# We're using the latest ipfs-api for the HTTPS support that was merged in
-# https://github.com/ferristseng/rust-ipfs-api/commit/55902e98d868dcce047863859caf596a629d10ec
-# but has not been released yet.
-ipfs-api = { git = "https://github.com/ferristseng/rust-ipfs-api", branch = "master", features = ["hyper-tls"] }
+clap = { version = "3.2.25", features = ["derive", "env"] }
+env_logger = "0.10.0"
+git-testament = "0.2"
+graphql-parser = "0.4.0"
+futures = { version = "0.3.1", features = ["compat"] }
 lazy_static = "1.2.0"
-url = "1.7.1"
-crossbeam-channel = "0.3.9"
+url = "2.3.1"
 graph = { path = "../graph" }
 graph-core = { path = "../core" }
-graph-datasource-ethereum = { path = "../datasource/ethereum" }
-graph-mock = { path = "../mock" }
+graph-chain-arweave = { path = "../chain/arweave" }
+graph-chain-ethereum = { path = "../chain/ethereum" }
+graph-chain-near = { path = "../chain/near" }
+graph-chain-cosmos = { path = "../chain/cosmos" }
+graph-chain-substreams = { path = "../chain/substreams" }
+graph-graphql = { path = "../graphql" }
 graph-runtime-wasm = { path = "../runtime/wasm" }
 graph-server-http = { path = "../server/http" }
 graph-server-index-node = { path = "../server/index-node" }
-graph-server-json-rpc = { path = "../server/json-rpc"}
+graph-server-json-rpc = { path = "../server/json-rpc" }
 graph-server-websocket = { path = "../server/websocket" }
+graph-server-metrics = { path = "../server/metrics" }
 graph-store-postgres = { path = "../store/postgres" }
-
-[dev-dependencies]
-assert_cli = "0.6"
+serde = { version = "1.0.126", features = ["derive", "rc"] }
+serde_regex = "1.1.0"
+toml = "0.7.1"
+shellexpand = "3.1.0"
+termcolor = "1.2.0"
+diesel = "1.4.8"
+http = "0.2.5" # must be compatible with the version rust-web3 uses
+prometheus = { version = "0.13.3", features = ["push"] }
+json-structural-diff = { version = "0.1", features = ["colorize"] }

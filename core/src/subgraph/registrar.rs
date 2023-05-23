@@ -1,71 +1,60 @@
-use lazy_static::lazy_static;
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{env, iter};
+use std::collections::HashSet;
+use std::time::Instant;
 
-lazy_static! {
-    // The timeout for IPFS requests in seconds
-    static ref IPFS_SUBGRAPH_LOADING_TIMEOUT: Duration = Duration::from_secs(
-        env::var("GRAPH_IPFS_SUBGRAPH_LOADING_TIMEOUT")
-            .unwrap_or("60".into())
-            .parse::<u64>()
-            .expect("invalid IPFS subgraph loading timeout")
-    );
-}
-
-use super::validation;
-use graph::data::subgraph::schema::{
-    generate_entity_id, SubgraphDeploymentAssignmentEntity, SubgraphDeploymentEntity,
-    SubgraphEntity, SubgraphVersionEntity, TypedEntity,
-};
+use async_trait::async_trait;
+use graph::blockchain::Blockchain;
+use graph::blockchain::BlockchainKind;
+use graph::blockchain::BlockchainMap;
+use graph::components::store::{DeploymentId, DeploymentLocator, SubscriptionManager};
+use graph::data::subgraph::schema::DeploymentCreate;
+use graph::data::subgraph::Graft;
 use graph::prelude::{
     CreateSubgraphResult, SubgraphAssignmentProvider as SubgraphAssignmentProviderTrait,
     SubgraphRegistrar as SubgraphRegistrarTrait, *,
 };
 
-pub struct SubgraphRegistrar<L, P, S, CS> {
+pub struct SubgraphRegistrar<P, S, SM> {
     logger: Logger,
     logger_factory: LoggerFactory,
-    resolver: Arc<L>,
+    resolver: Arc<dyn LinkResolver>,
     provider: Arc<P>,
     store: Arc<S>,
-    chain_stores: HashMap<String, Arc<CS>>,
+    subscription_manager: Arc<SM>,
+    chains: Arc<BlockchainMap>,
     node_id: NodeId,
     version_switching_mode: SubgraphVersionSwitchingMode,
     assignment_event_stream_cancel_guard: CancelGuard, // cancels on drop
 }
 
-impl<L, P, S, CS> SubgraphRegistrar<L, P, S, CS>
+impl<P, S, SM> SubgraphRegistrar<P, S, SM>
 where
-    L: LinkResolver,
     P: SubgraphAssignmentProviderTrait,
-    S: Store,
-    CS: ChainStore,
+    S: SubgraphStore,
+    SM: SubscriptionManager,
 {
     pub fn new(
         logger_factory: &LoggerFactory,
-        resolver: Arc<L>,
+        resolver: Arc<dyn LinkResolver>,
         provider: Arc<P>,
         store: Arc<S>,
-        chain_stores: HashMap<String, Arc<CS>>,
+        subscription_manager: Arc<SM>,
+        chains: Arc<BlockchainMap>,
         node_id: NodeId,
         version_switching_mode: SubgraphVersionSwitchingMode,
     ) -> Self {
         let logger = logger_factory.component_logger("SubgraphRegistrar", None);
         let logger_factory = logger_factory.with_parent(logger.clone());
 
+        let resolver = resolver.with_retries();
+
         SubgraphRegistrar {
             logger,
             logger_factory,
-            resolver: Arc::new(
-                resolver
-                    .as_ref()
-                    .clone()
-                    .with_timeout(*IPFS_SUBGRAPH_LOADING_TIMEOUT),
-            ),
+            resolver: resolver.into(),
             provider,
             store,
-            chain_stores,
+            subscription_manager,
+            chains,
             node_id,
             version_switching_mode,
             assignment_event_stream_cancel_guard: CancelGuard::new(),
@@ -99,25 +88,33 @@ where
         // - The event stream sees a Remove event for subgraph B, but the table query finds that
         //   subgraph B has already been removed.
         // The `handle_assignment_events` function handles these cases by ignoring AlreadyRunning
-        // (on subgraph start) or NotRunning (on subgraph stop) error types, which makes the
-        // operations idempotent.
+        // (on subgraph start) which makes the operations idempotent. Subgraph stop is already idempotent.
 
         // Start event stream
         let assignment_event_stream = self.assignment_events();
 
         // Deploy named subgraphs found in store
         self.start_assigned_subgraphs().and_then(move |()| {
-            // Spawn a task to handle assignment events
-            tokio::spawn(future::lazy(move || {
+            // Spawn a task to handle assignment events.
+            // Blocking due to store interactions. Won't be blocking after #905.
+            graph::spawn_blocking(
                 assignment_event_stream
+                    .compat()
                     .map_err(SubgraphAssignmentProviderError::Unknown)
                     .map_err(CancelableError::Error)
                     .cancelable(&assignment_event_stream_cancel_handle, || {
-                        CancelableError::Cancel
+                        Err(CancelableError::Cancel)
                     })
+                    .compat()
                     .for_each(move |assignment_event| {
                         assert_eq!(assignment_event.node_id(), &node_id);
-                        handle_assignment_event(assignment_event, provider.clone(), &logger_clone1)
+                        handle_assignment_event(
+                            assignment_event,
+                            provider.clone(),
+                            logger_clone1.clone(),
+                        )
+                        .boxed()
+                        .compat()
                     })
                     .map_err(move |e| match e {
                         CancelableError::Cancel => panic!("assignment event stream canceled"),
@@ -126,7 +123,8 @@ where
                             panic!("assignment event stream failed: {}", e);
                         }
                     })
-            }));
+                    .compat(),
+            );
 
             Ok(())
         })
@@ -137,77 +135,72 @@ where
         let node_id = self.node_id.clone();
         let logger = self.logger.clone();
 
-        store
-            .subscribe(vec![
-                SubgraphDeploymentAssignmentEntity::subgraph_entity_pair(),
-            ])
-            .map_err(|()| format_err!("Entity change stream failed"))
+        self.subscription_manager
+            .subscribe(FromIterator::from_iter([SubscriptionFilter::Assignment]))
+            .map_err(|()| anyhow!("Entity change stream failed"))
             .map(|event| {
                 // We're only interested in the SubgraphDeploymentAssignment change; we
                 // know that there is at least one, as that is what we subscribed to
-                stream::iter_ok(
-                    event
-                        .changes
-                        .into_iter()
-                        .filter(|change| change.entity_type == "SubgraphDeploymentAssignment"),
-                )
+                let filter = SubscriptionFilter::Assignment;
+                let assignments = event
+                    .changes
+                    .iter()
+                    .filter(|change| filter.matches(change))
+                    .map(|change| match change {
+                        EntityChange::Data { .. } => unreachable!(),
+                        EntityChange::Assignment {
+                            deployment,
+                            operation,
+                        } => (deployment.clone(), operation.clone()),
+                    })
+                    .collect::<Vec<_>>();
+                stream::iter_ok(assignments)
             })
             .flatten()
             .and_then(
-                move |entity_change| -> Result<Box<dyn Stream<Item = _, Error = _> + Send>, _> {
+                move |(deployment, operation)| -> Result<Box<dyn Stream<Item = _, Error = _> + Send>, _> {
                     trace!(logger, "Received assignment change";
-                                   "entity_change" => format!("{:?}", entity_change));
-                    let subgraph_hash = SubgraphDeploymentId::new(entity_change.entity_id.clone())
-                        .map_err(|()| {
-                            format_err!(
-                                "Invalid subgraph hash in assignment entity: {:#?}",
-                                entity_change.clone(),
-                            )
-                        })?;
+                                   "deployment" => %deployment,
+                                   "operation" => format!("{:?}", operation),
+                                );
 
-                    match entity_change.operation {
+                    match operation {
                         EntityChangeOperation::Set => {
                             store
-                                .get(SubgraphDeploymentAssignmentEntity::key(
-                                    subgraph_hash.clone(),
-                                ))
+                                .assigned_node(&deployment)
                                 .map_err(|e| {
-                                    format_err!("Failed to get subgraph assignment entity: {}", e)
+                                    anyhow!("Failed to get subgraph assignment entity: {}", e)
                                 })
-                                .map(
-                                    |entity_opt| -> Box<dyn Stream<Item = _, Error = _> + Send> {
-                                        if let Some(entity) = entity_opt {
-                                            if entity.get("nodeId")
-                                                == Some(&node_id.to_string().into())
-                                            {
-                                                // Start subgraph on this node
-                                                Box::new(stream::once(Ok(AssignmentEvent::Add {
-                                                    subgraph_id: subgraph_hash,
-                                                    node_id: node_id.clone(),
-                                                })))
-                                            } else {
-                                                // Ensure it is removed from this node
-                                                Box::new(stream::once(Ok(
-                                                    AssignmentEvent::Remove {
-                                                        subgraph_id: subgraph_hash,
-                                                        node_id: node_id.clone(),
-                                                    },
-                                                )))
-                                            }
+                                .map(|assigned| -> Box<dyn Stream<Item = _, Error = _> + Send> {
+                                    if let Some(assigned) = assigned {
+                                        if assigned == node_id {
+                                            // Start subgraph on this node
+                                            debug!(logger, "Deployment assignee is this node, broadcasting add event"; "assigned_to" => assigned, "node_id" => &node_id);
+                                            Box::new(stream::once(Ok(AssignmentEvent::Add {
+                                                deployment,
+                                                node_id: node_id.clone(),
+                                            })))
                                         } else {
-                                            // Was added/updated, but is now gone.
-                                            // We will get a separate Removed event later.
-                                            Box::new(stream::empty())
+                                            // Ensure it is removed from this node
+                                            debug!(logger, "Deployment assignee is not this node, broadcasting remove event"; "assigned_to" => assigned, "node_id" => &node_id);
+                                            Box::new(stream::once(Ok(AssignmentEvent::Remove {
+                                                deployment,
+                                                node_id: node_id.clone(),
+                                            })))
                                         }
-                                    },
-                                )
+                                    } else {
+                                        // Was added/updated, but is now gone.
+                                        debug!(logger, "Deployment has not assignee, we will get a separate remove event later"; "node_id" => &node_id);
+                                        Box::new(stream::empty())
+                                    }
+                                })
                         }
                         EntityChangeOperation::Removed => {
                             // Send remove event without checking node ID.
                             // If node ID does not match, then this is a no-op when handled in
                             // assignment provider.
                             Ok(Box::new(stream::once(Ok(AssignmentEvent::Remove {
-                                subgraph_id: subgraph_hash,
+                                deployment,
                                 node_id: node_id.clone(),
                             }))))
                         }
@@ -220,730 +213,442 @@ where
     fn start_assigned_subgraphs(&self) -> impl Future<Item = (), Error = Error> {
         let provider = self.provider.clone();
         let logger = self.logger.clone();
+        let node_id = self.node_id.clone();
 
-        // Create a query to find all assignments with this node ID
-        let assignment_query = SubgraphDeploymentAssignmentEntity::query()
-            .filter(EntityFilter::new_equal("nodeId", self.node_id.to_string()));
-
-        future::result(self.store.find(assignment_query))
-            .map_err(|e| format_err!("Error querying subgraph assignments: {}", e))
-            .and_then(move |assignment_entities| {
-                assignment_entities
-                    .into_iter()
-                    .map(|assignment_entity| {
-                        // Parse as subgraph hash
-                        assignment_entity.id().and_then(|id| {
-                            SubgraphDeploymentId::new(id).map_err(|()| {
-                                format_err!("Invalid subgraph hash in assignment entity")
-                            })
-                        })
-                    })
-                    .collect::<Result<HashSet<SubgraphDeploymentId>, _>>()
-            })
-            .and_then(move |subgraph_ids| {
+        future::result(self.store.assignments(&self.node_id))
+            .map_err(|e| anyhow!("Error querying subgraph assignments: {}", e))
+            .and_then(move |deployments| {
                 // This operation should finish only after all subgraphs are
                 // started. We wait for the spawned tasks to complete by giving
                 // each a `sender` and waiting for all of them to be dropped, so
                 // the receiver terminates without receiving anything.
-                let (sender, receiver) = tokio::sync::mpsc::channel::<()>(1);
-                for id in subgraph_ids {
+                let deployments = HashSet::<DeploymentLocator>::from_iter(deployments);
+                let deployments_len = deployments.len();
+                let (sender, receiver) = futures01::sync::mpsc::channel::<()>(1);
+                for id in deployments {
                     let sender = sender.clone();
-                    tokio::spawn(
-                        graph::util::futures::blocking(start_subgraph(
-                            id,
-                            &*provider,
-                            logger.clone(),
-                        ))
-                        .map(move |()| drop(sender))
-                        .map_err(|()| unreachable!()),
+                    let logger = logger.clone();
+
+                    graph::spawn(
+                        start_subgraph(id, provider.clone(), logger).map(move |()| drop(sender)),
                     );
                 }
                 drop(sender);
                 receiver.collect().then(move |_| {
-                    info!(logger, "Started all subgraphs");
+                    info!(logger, "Started all assigned subgraphs";
+                                  "count" => deployments_len, "node_id" => &node_id);
                     future::ok(())
                 })
             })
     }
 }
 
-impl<L, P, S, CS> SubgraphRegistrarTrait for SubgraphRegistrar<L, P, S, CS>
+#[async_trait]
+impl<P, S, SM> SubgraphRegistrarTrait for SubgraphRegistrar<P, S, SM>
 where
-    L: LinkResolver,
     P: SubgraphAssignmentProviderTrait,
-    S: Store,
-    CS: ChainStore,
+    S: SubgraphStore,
+    SM: SubscriptionManager,
 {
-    fn create_subgraph(
+    async fn create_subgraph(
         &self,
         name: SubgraphName,
-    ) -> Box<dyn Future<Item = CreateSubgraphResult, Error = SubgraphRegistrarError> + Send + 'static>
-    {
-        Box::new(future::result(create_subgraph(
-            &self.logger,
-            self.store.clone(),
-            name,
-        )))
+    ) -> Result<CreateSubgraphResult, SubgraphRegistrarError> {
+        let id = self.store.create_subgraph(name.clone())?;
+
+        debug!(self.logger, "Created subgraph"; "subgraph_name" => name.to_string());
+
+        Ok(CreateSubgraphResult { id })
     }
 
-    fn create_subgraph_version(
+    async fn create_subgraph_version(
         &self,
         name: SubgraphName,
-        hash: SubgraphDeploymentId,
+        hash: DeploymentHash,
         node_id: NodeId,
-    ) -> Box<dyn Future<Item = (), Error = SubgraphRegistrarError> + Send + 'static> {
-        let store = self.store.clone();
-        let chain_stores = self.chain_stores.clone();
-        let version_switching_mode = self.version_switching_mode;
+        debug_fork: Option<DeploymentHash>,
+        start_block_override: Option<BlockPtr>,
+        graft_block_override: Option<BlockPtr>,
+        history_blocks: Option<i32>,
+    ) -> Result<DeploymentLocator, SubgraphRegistrarError> {
+        // We don't have a location for the subgraph yet; that will be
+        // assigned when we deploy for real. For logging purposes, make up a
+        // fake locator
+        let logger = self
+            .logger_factory
+            .subgraph_logger(&DeploymentLocator::new(DeploymentId(0), hash.clone()));
 
-        let logger = self.logger_factory.subgraph_logger(&hash);
-
-        Box::new(
-            SubgraphManifest::resolve(hash.to_ipfs_link(), self.resolver.clone(), logger.clone())
-                .map_err(SubgraphRegistrarError::ResolveError)
-                .and_then(validation::validate_manifest)
-                .and_then(move |manifest| {
-                    let network_name = manifest.network_name()?;
-                    let chain_store = chain_stores
-                        .get(&network_name)
-                        .ok_or(SubgraphRegistrarError::NetworkNotSupported(network_name))?;
-                    create_subgraph_version(
-                        &logger,
-                        store,
-                        chain_store.clone(),
-                        name,
-                        manifest,
-                        node_id,
-                        version_switching_mode,
+        let raw: serde_yaml::Mapping = {
+            let file_bytes = self
+                .resolver
+                .cat(&logger, &hash.to_ipfs_link())
+                .await
+                .map_err(|e| {
+                    SubgraphRegistrarError::ResolveError(
+                        SubgraphManifestResolveError::ResolveError(e),
                     )
-                }),
-        )
+                })?;
+
+            serde_yaml::from_slice(&file_bytes)
+                .map_err(|e| SubgraphRegistrarError::ResolveError(e.into()))?
+        };
+
+        let kind = BlockchainKind::from_manifest(&raw).map_err(|e| {
+            SubgraphRegistrarError::ResolveError(SubgraphManifestResolveError::ResolveError(e))
+        })?;
+
+        let deployment_locator = match kind {
+            BlockchainKind::Arweave => {
+                create_subgraph_version::<graph_chain_arweave::Chain, _>(
+                    &logger,
+                    self.store.clone(),
+                    self.chains.cheap_clone(),
+                    name.clone(),
+                    hash.cheap_clone(),
+                    start_block_override,
+                    graft_block_override,
+                    raw,
+                    node_id,
+                    debug_fork,
+                    self.version_switching_mode,
+                    &self.resolver,
+                    history_blocks,
+                )
+                .await?
+            }
+            BlockchainKind::Ethereum => {
+                create_subgraph_version::<graph_chain_ethereum::Chain, _>(
+                    &logger,
+                    self.store.clone(),
+                    self.chains.cheap_clone(),
+                    name.clone(),
+                    hash.cheap_clone(),
+                    start_block_override,
+                    graft_block_override,
+                    raw,
+                    node_id,
+                    debug_fork,
+                    self.version_switching_mode,
+                    &self.resolver,
+                    history_blocks,
+                )
+                .await?
+            }
+            BlockchainKind::Near => {
+                create_subgraph_version::<graph_chain_near::Chain, _>(
+                    &logger,
+                    self.store.clone(),
+                    self.chains.cheap_clone(),
+                    name.clone(),
+                    hash.cheap_clone(),
+                    start_block_override,
+                    graft_block_override,
+                    raw,
+                    node_id,
+                    debug_fork,
+                    self.version_switching_mode,
+                    &self.resolver,
+                    history_blocks,
+                )
+                .await?
+            }
+            BlockchainKind::Cosmos => {
+                create_subgraph_version::<graph_chain_cosmos::Chain, _>(
+                    &logger,
+                    self.store.clone(),
+                    self.chains.cheap_clone(),
+                    name.clone(),
+                    hash.cheap_clone(),
+                    start_block_override,
+                    graft_block_override,
+                    raw,
+                    node_id,
+                    debug_fork,
+                    self.version_switching_mode,
+                    &self.resolver,
+                    history_blocks,
+                )
+                .await?
+            }
+            BlockchainKind::Substreams => {
+                create_subgraph_version::<graph_chain_substreams::Chain, _>(
+                    &logger,
+                    self.store.clone(),
+                    self.chains.cheap_clone(),
+                    name.clone(),
+                    hash.cheap_clone(),
+                    start_block_override,
+                    graft_block_override,
+                    raw,
+                    node_id,
+                    debug_fork,
+                    self.version_switching_mode,
+                    &self.resolver,
+                    history_blocks,
+                )
+                .await?
+            }
+        };
+
+        debug!(
+            &logger,
+            "Wrote new subgraph version to store";
+            "subgraph_name" => name.to_string(),
+            "subgraph_hash" => hash.to_string(),
+        );
+
+        Ok(deployment_locator)
     }
 
-    fn remove_subgraph(
-        &self,
-        name: SubgraphName,
-    ) -> Box<dyn Future<Item = (), Error = SubgraphRegistrarError> + Send + 'static> {
-        Box::new(future::result(remove_subgraph(
-            &self.logger,
-            self.store.clone(),
-            name,
-        )))
+    async fn remove_subgraph(&self, name: SubgraphName) -> Result<(), SubgraphRegistrarError> {
+        self.store.clone().remove_subgraph(name.clone())?;
+
+        debug!(self.logger, "Removed subgraph"; "subgraph_name" => name.to_string());
+
+        Ok(())
     }
 
-    fn reassign_subgraph(
+    /// Reassign a subgraph deployment to a different node.
+    ///
+    /// Reassigning to a nodeId that does not match any reachable graph-nodes will effectively pause the
+    /// subgraph syncing process.
+    async fn reassign_subgraph(
         &self,
-        hash: SubgraphDeploymentId,
-        node_id: NodeId,
-    ) -> Box<dyn Future<Item = (), Error = SubgraphRegistrarError> + Send + 'static> {
-        Box::new(future::result(reassign_subgraph(
-            self.store.clone(),
-            hash,
-            node_id,
-        )))
+        hash: &DeploymentHash,
+        node_id: &NodeId,
+    ) -> Result<(), SubgraphRegistrarError> {
+        let locator = self.store.active_locator(hash)?;
+        let deployment =
+            locator.ok_or_else(|| SubgraphRegistrarError::DeploymentNotFound(hash.to_string()))?;
+
+        self.store.reassign_subgraph(&deployment, node_id)?;
+
+        Ok(())
     }
 }
 
-fn handle_assignment_event<P>(
+async fn handle_assignment_event(
     event: AssignmentEvent,
-    provider: Arc<P>,
-    logger: &Logger,
-) -> Box<dyn Future<Item = (), Error = CancelableError<SubgraphAssignmentProviderError>> + Send>
-where
-    P: SubgraphAssignmentProviderTrait,
-{
-    let logger = logger.to_owned();
+    provider: Arc<impl SubgraphAssignmentProviderTrait>,
+    logger: Logger,
+) -> Result<(), CancelableError<SubgraphAssignmentProviderError>> {
+    let logger = logger.clone();
 
     debug!(logger, "Received assignment event: {:?}", event);
 
     match event {
         AssignmentEvent::Add {
-            subgraph_id,
+            deployment,
             node_id: _,
-        } => Box::new(start_subgraph(subgraph_id, &*provider, logger).map_err(|()| unreachable!())),
+        } => {
+            start_subgraph(deployment, provider.clone(), logger).await;
+            Ok(())
+        }
         AssignmentEvent::Remove {
-            subgraph_id,
+            deployment,
             node_id: _,
-        } => Box::new(
-            provider
-                .stop(subgraph_id)
-                .then(|result| match result {
-                    Ok(()) => Ok(()),
-                    Err(SubgraphAssignmentProviderError::NotRunning(_)) => Ok(()),
-                    Err(e) => Err(e),
-                })
-                .map_err(CancelableError::Error),
-        ),
+        } => match provider.stop(deployment).await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(CancelableError::Error(e)),
+        },
     }
 }
 
-// Never errors.
-fn start_subgraph<P: SubgraphAssignmentProviderTrait>(
-    subgraph_id: SubgraphDeploymentId,
-    provider: &P,
+async fn start_subgraph(
+    deployment: DeploymentLocator,
+    provider: Arc<impl SubgraphAssignmentProviderTrait>,
     logger: Logger,
-) -> impl Future<Item = (), Error = ()> + 'static {
-    trace!(
-        logger,
-        "Start subgraph";
-        "subgraph_id" => subgraph_id.to_string()
-    );
+) {
+    let logger = logger
+        .new(o!("subgraph_id" => deployment.hash.to_string(), "sgd" => deployment.id.to_string()));
+
+    trace!(logger, "Start subgraph");
 
     let start_time = Instant::now();
-    provider
-        .start(subgraph_id.clone())
-        .then(move |result| -> Result<(), _> {
-            debug!(
-                logger,
-                "Subgraph started";
-                "subgraph_id" => subgraph_id.to_string(),
-                "start_ms" => start_time.elapsed().as_millis()
-            );
+    let result = provider.start(deployment.clone(), None).await;
 
-            match result {
-                Ok(()) => Ok(()),
-                Err(SubgraphAssignmentProviderError::AlreadyRunning(_)) => Ok(()),
-                Err(e) => {
-                    // Errors here are likely an issue with the subgraph.
-                    error!(
-                        logger,
-                        "Subgraph instance failed to start";
-                        "error" => e.to_string(),
-                        "subgraph_id" => subgraph_id.to_string()
-                    );
-                    Ok(())
-                }
-            }
+    debug!(
+        logger,
+        "Subgraph started";
+        "start_ms" => start_time.elapsed().as_millis()
+    );
+
+    match result {
+        Ok(()) => (),
+        Err(SubgraphAssignmentProviderError::AlreadyRunning(_)) => (),
+        Err(e) => {
+            // Errors here are likely an issue with the subgraph.
+            error!(
+                logger,
+                "Subgraph instance failed to start";
+                "error" => e.to_string()
+            );
+        }
+    }
+}
+
+/// Resolves the subgraph's earliest block
+async fn resolve_start_block(
+    manifest: &SubgraphManifest<impl Blockchain>,
+    chain: &impl Blockchain,
+    logger: &Logger,
+) -> Result<Option<BlockPtr>, SubgraphRegistrarError> {
+    // If the minimum start block is 0 (i.e. the genesis block),
+    // return `None` to start indexing from the genesis block. Otherwise
+    // return a block pointer for the block with number `min_start_block - 1`.
+    match manifest
+        .start_blocks()
+        .into_iter()
+        .min()
+        .expect("cannot identify minimum start block because there are no data sources")
+    {
+        0 => Ok(None),
+        min_start_block => chain
+            .block_pointer_from_number(logger, min_start_block - 1)
+            .await
+            .map(Some)
+            .map_err(move |_| {
+                SubgraphRegistrarError::ManifestValidationError(vec![
+                    SubgraphManifestValidationError::BlockNotFound(min_start_block.to_string()),
+                ])
+            }),
+    }
+}
+
+/// Resolves the manifest's graft base block
+async fn resolve_graft_block(
+    base: &Graft,
+    chain: &impl Blockchain,
+    logger: &Logger,
+) -> Result<BlockPtr, SubgraphRegistrarError> {
+    chain
+        .block_pointer_from_number(logger, base.block)
+        .await
+        .map_err(|_| {
+            SubgraphRegistrarError::ManifestValidationError(vec![
+                SubgraphManifestValidationError::BlockNotFound(format!(
+                    "graft base block {} not found",
+                    base.block
+                )),
+            ])
         })
 }
 
-fn create_subgraph(
+async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
     logger: &Logger,
-    store: Arc<impl Store>,
+    store: Arc<S>,
+    chains: Arc<BlockchainMap>,
     name: SubgraphName,
-) -> Result<CreateSubgraphResult, SubgraphRegistrarError> {
-    let mut ops = vec![];
-
-    // Check if this subgraph already exists
-    let subgraph_entity_opt = store.find_one(
-        SubgraphEntity::query().filter(EntityFilter::new_equal("name", name.to_string())),
-    )?;
-    if subgraph_entity_opt.is_some() {
-        debug!(
-            logger,
-            "Subgraph name already exists: {:?}",
-            name.to_string()
-        );
-        return Err(SubgraphRegistrarError::NameExists(name.to_string()));
-    }
-
-    ops.push(MetadataOperation::AbortUnless {
-        description: "Subgraph entity should not exist".to_owned(),
-        query: SubgraphEntity::query().filter(EntityFilter::new_equal("name", name.to_string())),
-        entity_ids: vec![],
-    });
-
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let entity = SubgraphEntity::new(name.clone(), None, None, created_at);
-    let entity_id = generate_entity_id();
-    ops.extend(
-        entity
-            .write_operations(&entity_id)
-            .into_iter()
-            .map(|op| op.into()),
-    );
-
-    store.apply_metadata_operations(ops)?;
-
-    debug!(logger, "Created subgraph"; "subgraph_name" => name.to_string());
-
-    Ok(CreateSubgraphResult { id: entity_id })
-}
-
-fn create_subgraph_version(
-    logger: &Logger,
-    store: Arc<impl Store>,
-    chain_store: Arc<impl ChainStore>,
-    name: SubgraphName,
-    manifest: SubgraphManifest,
+    deployment: DeploymentHash,
+    start_block_override: Option<BlockPtr>,
+    graft_block_override: Option<BlockPtr>,
+    raw: serde_yaml::Mapping,
     node_id: NodeId,
+    debug_fork: Option<DeploymentHash>,
     version_switching_mode: SubgraphVersionSwitchingMode,
-) -> Result<(), SubgraphRegistrarError> {
-    let mut ops = vec![];
+    resolver: &Arc<dyn LinkResolver>,
+    history_blocks: Option<i32>,
+) -> Result<DeploymentLocator, SubgraphRegistrarError> {
+    let raw_string = serde_yaml::to_string(&raw).unwrap();
+    let unvalidated = UnvalidatedSubgraphManifest::<C>::resolve(
+        deployment,
+        raw,
+        resolver,
+        logger,
+        ENV_VARS.max_spec_version.clone(),
+    )
+    .map_err(SubgraphRegistrarError::ResolveError)
+    .await?;
 
-    // Look up subgraph entity by name
-    let subgraph_entity_opt = store.find_one(
-        SubgraphEntity::query().filter(EntityFilter::new_equal("name", name.to_string())),
-    )?;
-    let subgraph_entity = subgraph_entity_opt.ok_or_else(|| {
+    let manifest = unvalidated
+        .validate(store.cheap_clone(), true)
+        .await
+        .map_err(SubgraphRegistrarError::ManifestValidationError)?;
+
+    let network_name = manifest.network_name();
+
+    let chain = chains
+        .get::<C>(network_name.clone())
+        .map_err(SubgraphRegistrarError::NetworkNotSupported)?
+        .cheap_clone();
+
+    let logger = logger.clone();
+    let store = store.clone();
+    let deployment_store = store.clone();
+
+    if !store.subgraph_exists(&name)? {
         debug!(
             logger,
             "Subgraph not found, could not create_subgraph_version";
             "subgraph_name" => name.to_string()
         );
-        SubgraphRegistrarError::NameNotFound(name.to_string())
-    })?;
-    let subgraph_entity_id = subgraph_entity.id()?;
-    let current_version_id_opt = match subgraph_entity.get("currentVersion") {
-        Some(Value::String(current_version_id)) => Some(current_version_id.to_owned()),
-        Some(Value::Null) => None,
-        None => None,
-        Some(_) => panic!("subgraph entity has invalid type in currentVersion field"),
-    };
-    let pending_version_id_opt = match subgraph_entity.get("pendingVersion") {
-        Some(Value::String(pending_version_id)) => Some(pending_version_id.to_owned()),
-        Some(Value::Null) => None,
-        None => None,
-        Some(_) => panic!("subgraph entity has invalid type in pendingVersion field"),
-    };
-    ops.push(MetadataOperation::AbortUnless {
-        description:
-            "Subgraph entity must still exist, have same name/currentVersion/pendingVersion"
-                .to_owned(),
-        query: SubgraphEntity::query().filter(EntityFilter::And(vec![
-            EntityFilter::new_equal("name", name.to_string()),
-            EntityFilter::new_equal("currentVersion", current_version_id_opt.clone()),
-            EntityFilter::new_equal("pendingVersion", pending_version_id_opt.clone()),
-        ])),
-        entity_ids: vec![subgraph_entity_id.clone()],
-    });
-
-    // Look up current version's deployment hash
-    let current_version_hash_opt = match current_version_id_opt {
-        Some(ref current_version_id) => Some(get_subgraph_version_deployment_id(
-            store.clone(),
-            current_version_id.clone(),
-        )?),
-        None => None,
-    };
-
-    // Look up pending version's deployment hash
-    let pending_version_hash_opt = match pending_version_id_opt {
-        Some(ref pending_version_id) => Some(get_subgraph_version_deployment_id(
-            store.clone(),
-            pending_version_id.clone(),
-        )?),
-        None => None,
-    };
-
-    // See if current version is fully synced
-    let current_is_synced = match &current_version_hash_opt {
-        Some(hash) => store.is_deployment_synced(hash.to_owned())?,
-        None => false,
-    };
-
-    // Find all subgraph version entities that point to this hash or a hash
-    let (version_summaries_before, read_summaries_ops) = store.read_subgraph_version_summaries(
-        iter::once(manifest.id.clone())
-            .chain(current_version_hash_opt)
-            .chain(pending_version_hash_opt)
-            .collect(),
-    )?;
-    ops.extend(read_summaries_ops);
-
-    // Create the subgraph version entity
-    let version_entity_id = generate_entity_id();
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    ops.extend(
-        SubgraphVersionEntity::new(subgraph_entity_id.clone(), manifest.id.clone(), created_at)
-            .write_operations(&version_entity_id)
-            .into_iter()
-            .map(|op| op.into()),
-    );
-
-    // Simulate the creation of the new version and updating of Subgraph.pending/current
-    let version_summaries_after = match version_switching_mode {
-        SubgraphVersionSwitchingMode::Instant => {
-            // Previously pending or current versions will no longer be pending/current
-            let mut version_summaries_after = version_summaries_before
-                .clone()
-                .into_iter()
-                .map(|mut version_summary| {
-                    if Some(&version_summary.id) == pending_version_id_opt.as_ref() {
-                        version_summary.pending = false;
-                    }
-
-                    if Some(&version_summary.id) == current_version_id_opt.as_ref() {
-                        version_summary.current = false;
-                    }
-
-                    version_summary
-                })
-                .collect::<Vec<_>>();
-
-            // Add new version, which will immediately be current
-            version_summaries_after.push(SubgraphVersionSummary {
-                id: version_entity_id.clone(),
-                subgraph_id: subgraph_entity_id.clone(),
-                deployment_id: manifest.id.clone(),
-                pending: false,
-                current: true,
-            });
-
-            version_summaries_after
-        }
-        SubgraphVersionSwitchingMode::Synced => {
-            // There is a current version. Depending on whether it is synced
-            // or not, make the new version the pending or the current version
-            if current_version_id_opt.is_some() {
-                // Previous pending version (if there was one) is no longer pending
-                // Previous current version if it's not fully synced is no
-                // longer the current version
-                let mut version_summaries_after = version_summaries_before
-                    .clone()
-                    .into_iter()
-                    .map(|mut version_summary| {
-                        if Some(&version_summary.id) == pending_version_id_opt.as_ref() {
-                            version_summary.pending = false;
-                        }
-                        if !current_is_synced
-                            && Some(&version_summary.id) == current_version_id_opt.as_ref()
-                        {
-                            // We will make the new version the current version
-                            version_summary.current = false;
-                        }
-
-                        version_summary
-                    })
-                    .collect::<Vec<_>>();
-
-                // Determine if this new version should be the pending or
-                // current version. When we add a version to a subgraph that
-                // already has a current version, the new version becomes the
-                // pending version if the current version is synced,
-                // and replaces the current version if the current version is still syncing
-                let (pending, current) = if current_is_synced {
-                    (true, false)
-                } else {
-                    (false, true)
-                };
-
-                // Add new version, setting pending and current appropriately
-                version_summaries_after.push(SubgraphVersionSummary {
-                    id: version_entity_id.clone(),
-                    subgraph_id: subgraph_entity_id.clone(),
-                    deployment_id: manifest.id.clone(),
-                    pending,
-                    current,
-                });
-
-                version_summaries_after
-            } else {
-                // No need to process list, as there is no current version
-                let mut version_summaries_after = version_summaries_before.clone();
-
-                // Add new version, which will immediately be current
-                version_summaries_after.push(SubgraphVersionSummary {
-                    id: version_entity_id.clone(),
-                    subgraph_id: subgraph_entity_id.clone(),
-                    deployment_id: manifest.id.clone(),
-                    pending: false,
-                    current: true,
-                });
-
-                version_summaries_after
-            }
-        }
-    };
-
-    // Check if subgraph deployment already exists for this hash
-    let deployment_exists = store
-        .get(SubgraphDeploymentEntity::key(manifest.id.clone()))?
-        .is_some();
-
-    ops.push(MetadataOperation::AbortUnless {
-        description: "Subgraph deployment entity must continue to exist/not exist".to_owned(),
-        query: SubgraphDeploymentEntity::query()
-            .filter(EntityFilter::new_equal("id", manifest.id.to_string())),
-        entity_ids: if deployment_exists {
-            vec![manifest.id.to_string()]
-        } else {
-            vec![]
-        },
-    });
-
-    // Create deployment only if it does not exist already
-    if !deployment_exists {
-        let chain_head_block = chain_store.chain_head_ptr()?;
-        let genesis_block = chain_store.genesis_block_ptr()?;
-        ops.extend(
-            SubgraphDeploymentEntity::new(&manifest, false, false, genesis_block, chain_head_block)
-                .create_operations(&manifest.id),
-        );
+        return Err(SubgraphRegistrarError::NameNotFound(name.to_string()));
     }
 
-    // Possibly add assignment for new deployment hash, and possibly remove assignments for old
-    // current/pending
-    ops.extend(
-        store
-            .reconcile_assignments(
-                logger,
-                version_summaries_before,
-                version_summaries_after,
-                Some(node_id),
-            )
-            .into_iter()
-            .map(|op| op.into()),
-    );
+    let start_block = match start_block_override {
+        Some(block) => Some(block),
+        None => resolve_start_block(&manifest, &*chain, &logger).await?,
+    };
 
-    // Update current/pending versions in Subgraph entity
-    match version_switching_mode {
-        SubgraphVersionSwitchingMode::Instant => {
-            ops.extend(SubgraphEntity::update_pending_version_operations(
-                &subgraph_entity_id,
-                None,
-            ));
-            ops.extend(SubgraphEntity::update_current_version_operations(
-                &subgraph_entity_id,
-                Some(version_entity_id),
-            ));
-        }
-        SubgraphVersionSwitchingMode::Synced => {
-            // Set the new version as pending, unless there is no fully synced
-            // current versions
-            if current_is_synced {
-                ops.extend(SubgraphEntity::update_pending_version_operations(
-                    &subgraph_entity_id,
-                    Some(version_entity_id),
-                ));
-            } else {
-                ops.extend(SubgraphEntity::update_pending_version_operations(
-                    &subgraph_entity_id,
-                    None,
-                ));
-                ops.extend(SubgraphEntity::update_current_version_operations(
-                    &subgraph_entity_id,
-                    Some(version_entity_id),
-                ));
-            }
-        }
-    }
-
-    // Commit entity ops
-    let manifest_id = manifest.id.to_string();
-    if deployment_exists {
-        store.apply_metadata_operations(ops)?
-    } else {
-        store.create_subgraph_deployment(logger, &manifest.schema, ops)?;
-    }
-
-    debug!(
-        logger,
-        "Wrote new subgraph version to store";
-        "subgraph_name" => name.to_string(),
-        "subgraph_hash" => manifest_id,
-    );
-
-    Ok(())
-}
-
-fn get_subgraph_version_deployment_id(
-    store: Arc<impl Store>,
-    version_id: String,
-) -> Result<SubgraphDeploymentId, SubgraphRegistrarError> {
-    let version_entity = store
-        .get(SubgraphVersionEntity::key(version_id))?
-        .ok_or_else(|| TransactionAbortError::Other(format!("Subgraph version entity missing")))
-        .map_err(StoreError::from)?;
-
-    Ok(SubgraphDeploymentId::new(
-        version_entity
-            .get("deployment")
-            .unwrap()
-            .to_owned()
-            .as_string()
-            .unwrap(),
-    )
-    .unwrap())
-}
-
-fn remove_subgraph(
-    logger: &Logger,
-    store: Arc<impl Store>,
-    name: SubgraphName,
-) -> Result<(), SubgraphRegistrarError> {
-    let mut ops = vec![];
-
-    // Find the subgraph entity
-    let subgraph_entity_opt = store
-        .find_one(SubgraphEntity::query().filter(EntityFilter::new_equal("name", name.to_string())))
-        .map_err(|e| format_err!("query execution error: {}", e))?;
-    let subgraph_entity = subgraph_entity_opt
-        .ok_or_else(|| SubgraphRegistrarError::NameNotFound(name.to_string()))?;
-
-    ops.push(MetadataOperation::AbortUnless {
-        description: "Subgraph entity must still exist".to_owned(),
-        query: SubgraphEntity::query().filter(EntityFilter::new_equal("name", name.to_string())),
-        entity_ids: vec![subgraph_entity.id().unwrap()],
-    });
-
-    // Find subgraph version entities
-    let subgraph_version_entities = store.find(SubgraphVersionEntity::query().filter(
-        EntityFilter::new_equal("subgraph", subgraph_entity.id().unwrap()),
-    ))?;
-
-    ops.push(MetadataOperation::AbortUnless {
-        description: "Subgraph must have same set of versions".to_owned(),
-        query: SubgraphVersionEntity::query().filter(EntityFilter::new_equal(
-            "subgraph",
-            subgraph_entity.id().unwrap(),
+    let base_block = match &manifest.graft {
+        None => None,
+        Some(graft) => Some((
+            graft.base.clone(),
+            match graft_block_override {
+                Some(block) => block,
+                None => resolve_graft_block(graft, &*chain, &logger).await?,
+            },
         )),
-        entity_ids: subgraph_version_entities
-            .iter()
-            .map(|entity| entity.id().unwrap())
-            .collect(),
-    });
+    };
 
-    // Remove subgraph version entities, and their deployment/assignment when applicable
-    ops.extend(
-        remove_subgraph_versions(logger, store.clone(), subgraph_version_entities)?
-            .into_iter()
-            .map(|op| op.into()),
+    info!(
+        logger,
+        "Set subgraph start block";
+        "block" => format!("{:?}", start_block),
     );
 
-    // Remove the subgraph entity
-    ops.push(MetadataOperation::Remove {
-        entity: SubgraphEntity::TYPENAME.to_owned(),
-        id: subgraph_entity.id()?,
-    });
+    info!(
+        logger,
+        "Graft base";
+        "base" => format!("{:?}", base_block.as_ref().map(|(subgraph,_)| subgraph.to_string())),
+        "block" => format!("{:?}", base_block.as_ref().map(|(_,ptr)| ptr.number))
+    );
 
-    store.apply_metadata_operations(ops)?;
-
-    debug!(logger, "Removed subgraph"; "subgraph_name" => name.to_string());
-
-    Ok(())
-}
-
-/// Remove a set of subgraph versions atomically.
-///
-/// It may seem like it would be easier to generate the EntityOperations for subgraph versions
-/// removal one at a time, but that approach is significantly complicated by the fact that the
-/// store does not reflect the EntityOperations that have been accumulated so far. Earlier subgraph
-/// version creations/removals can affect later ones by affecting whether or not a subgraph deployment
-/// or assignment needs to be created/removed.
-fn remove_subgraph_versions(
-    logger: &Logger,
-    store: Arc<impl Store>,
-    version_entities_to_delete: Vec<Entity>,
-) -> Result<Vec<MetadataOperation>, SubgraphRegistrarError> {
-    let mut ops = vec![];
-
-    let version_entity_ids_to_delete = version_entities_to_delete
+    // Entity types that may be touched by offchain data sources need a causality region column.
+    let needs_causality_region = manifest
+        .data_sources
         .iter()
-        .map(|version_entity| version_entity.id().unwrap())
-        .collect::<HashSet<_>>();
+        .filter_map(|ds| ds.as_offchain())
+        .map(|ds| ds.mapping.entities.iter())
+        .chain(
+            manifest
+                .templates
+                .iter()
+                .filter_map(|ds| ds.as_offchain())
+                .map(|ds| ds.mapping.entities.iter()),
+        )
+        .flatten()
+        .cloned()
+        .collect();
 
-    // Get hashes that are referenced by versions that will be deleted.
-    // These are candidates for clean up.
-    let referenced_subgraph_hashes = version_entities_to_delete
-        .iter()
-        .map(|version_entity| {
-            SubgraphDeploymentId::new(
-                version_entity
-                    .get("deployment")
-                    .unwrap()
-                    .to_owned()
-                    .as_string()
-                    .unwrap(),
-            )
-            .unwrap()
-        })
-        .collect::<HashSet<_>>();
-
-    // Find all subgraph version entities that point to these subgraph deployments
-    let (version_summaries, read_summaries_ops) =
-        store.read_subgraph_version_summaries(referenced_subgraph_hashes.into_iter().collect())?;
-    ops.extend(read_summaries_ops);
-
-    // Simulate the planned removal of SubgraphVersion entities
-    let version_summaries_after_delete = version_summaries
-        .clone()
-        .into_iter()
-        .filter(|version_summary| !version_entity_ids_to_delete.contains(&version_summary.id))
-        .collect::<Vec<_>>();
-
-    // Create/remove assignments based on the subgraph version changes.
-    // We are only deleting versions here, so no assignments will be created,
-    // and we can safely pass None for the node ID.
-    ops.extend(
-        store
-            .reconcile_assignments(
-                logger,
-                version_summaries,
-                version_summaries_after_delete,
-                None,
-            )
-            .into_iter()
-            .map(|op| op.into()),
-    );
-
-    // Actually remove the subgraph version entities.
-    // Note: we do this last because earlier AbortUnless ops depend on these entities still
-    // existing.
-    ops.extend(
-        version_entities_to_delete
-            .iter()
-            .map(|version_entity| MetadataOperation::Remove {
-                entity: SubgraphVersionEntity::TYPENAME.to_owned(),
-                id: version_entity.id().unwrap(),
-            }),
-    );
-
-    Ok(ops)
-}
-
-/// Reassign a subgraph deployment to a different node.
-///
-/// Reassigning to a nodeId that does not match any reachable graph-nodes will effectively pause the
-/// subgraph syncing process.
-fn reassign_subgraph(
-    store: Arc<impl Store>,
-    hash: SubgraphDeploymentId,
-    node_id: NodeId,
-) -> Result<(), SubgraphRegistrarError> {
-    let mut ops = vec![];
-
-    let current_deployment = store.find(
-        SubgraphDeploymentAssignmentEntity::query()
-            .filter(EntityFilter::new_equal("id", hash.clone().to_string())),
-    )?;
-
-    let current_node_id = current_deployment
-        .first()
-        .and_then(|d| d.get("nodeId"))
-        .ok_or_else(|| SubgraphRegistrarError::DeploymentNotFound(hash.clone().to_string()))?;
-
-    if current_node_id.to_string() == node_id.to_string() {
-        return Err(SubgraphRegistrarError::DeploymentAssignmentUnchanged(
-            hash.clone().to_string(),
-        ));
+    // Apply the subgraph versioning and deployment operations,
+    // creating a new subgraph deployment if one doesn't exist.
+    let mut deployment = DeploymentCreate::new(raw_string, &manifest, start_block)
+        .graft(base_block)
+        .debug(debug_fork)
+        .entities_with_causality_region(needs_causality_region);
+    if let Some(history_blocks) = history_blocks {
+        deployment = deployment.with_history_blocks(history_blocks);
     }
 
-    ops.push(MetadataOperation::AbortUnless {
-        description: "Deployment assignment is unchanged".to_owned(),
-        query: SubgraphDeploymentAssignmentEntity::query().filter(EntityFilter::And(vec![
-            EntityFilter::new_equal("nodeId", current_node_id.to_string()),
-            EntityFilter::new_equal("id", hash.clone().to_string()),
-        ])),
-        entity_ids: vec![hash.clone().to_string()],
-    });
-
-    // Create the assignment update operations.
-    // Note: This will also generate a remove operation for the existing subgraph assignment.
-    ops.extend(
-        SubgraphDeploymentAssignmentEntity::new(node_id)
-            .write_operations(&hash.clone())
-            .into_iter()
-            .map(|op| op.into()),
-    );
-
-    store.apply_metadata_operations(ops)?;
-
-    Ok(())
+    deployment_store
+        .create_subgraph_deployment(
+            name,
+            &manifest.schema,
+            deployment,
+            node_id,
+            network_name,
+            version_switching_mode,
+        )
+        .map_err(SubgraphRegistrarError::SubgraphDeploymentError)
 }

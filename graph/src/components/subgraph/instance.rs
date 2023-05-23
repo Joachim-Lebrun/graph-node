@@ -1,52 +1,117 @@
-use crate::prelude::*;
-use web3::types::Log;
+use crate::{
+    blockchain::Blockchain,
+    components::store::{EntityKey, ReadStore, StoredDynamicDataSource},
+    data::subgraph::schema::SubgraphError,
+    data_source::DataSourceTemplate,
+    prelude::*,
+    util::lfu_cache::LfuCache,
+};
 
 #[derive(Clone, Debug)]
-pub struct DataSourceTemplateInfo {
-    pub data_source: String,
-    pub template: DataSourceTemplate,
+pub struct DataSourceTemplateInfo<C: Blockchain> {
+    pub template: DataSourceTemplate<C>,
     pub params: Vec<String>,
+    pub context: Option<DataSourceContext>,
+    pub creation_block: BlockNumber,
 }
 
-#[derive(Debug, Default)]
-pub struct BlockState {
+#[derive(Debug)]
+pub struct BlockState<C: Blockchain> {
     pub entity_cache: EntityCache,
-    pub created_data_sources: Vec<DataSourceTemplateInfo>,
+    pub deterministic_errors: Vec<SubgraphError>,
+    created_data_sources: Vec<DataSourceTemplateInfo<C>>,
+
+    // Data sources to be transacted into the store.
+    pub persisted_data_sources: Vec<StoredDynamicDataSource>,
+
+    // Data sources created in the current handler.
+    handler_created_data_sources: Vec<DataSourceTemplateInfo<C>>,
+
+    // data source that have been processed.
+    pub processed_data_sources: Vec<StoredDynamicDataSource>,
+
+    // Marks whether a handler is currently executing.
+    in_handler: bool,
 }
 
-/// Represents a loaded instance of a subgraph.
-pub trait SubgraphInstance<T>: Sized + Sync
-where
-    T: RuntimeHostBuilder,
-{
-    /// Creates a subgraph instance from a manifest.
-    fn from_manifest(
-        logger: &Logger,
-        manifest: SubgraphManifest,
-        host_builder: &T,
-    ) -> Result<Self, Error>;
+impl<C: Blockchain> BlockState<C> {
+    pub fn new(store: impl ReadStore, lfu_cache: LfuCache<EntityKey, Option<Entity>>) -> Self {
+        BlockState {
+            entity_cache: EntityCache::with_current(Arc::new(store), lfu_cache),
+            deterministic_errors: Vec::new(),
+            created_data_sources: Vec::new(),
+            persisted_data_sources: Vec::new(),
+            handler_created_data_sources: Vec::new(),
+            processed_data_sources: Vec::new(),
+            in_handler: false,
+        }
+    }
 
-    /// Returns true if the subgraph has a handler for an Ethereum event.
-    fn matches_log(&self, log: &Log) -> bool;
+    pub fn extend(&mut self, other: BlockState<C>) {
+        assert!(!other.in_handler);
 
-    /// Process and Ethereum trigger and return the resulting entity operations as a future.
-    fn process_trigger(
-        &self,
-        logger: &Logger,
-        block: Arc<EthereumBlock>,
-        trigger: EthereumTrigger,
-        state: BlockState,
-    ) -> Box<dyn Future<Item = BlockState, Error = Error> + Send>;
+        let BlockState {
+            entity_cache,
+            deterministic_errors,
+            created_data_sources,
+            persisted_data_sources,
+            handler_created_data_sources,
+            processed_data_sources,
+            in_handler,
+        } = self;
 
-    /// Like `process_trigger` but processes an Ethereum event in a given list of hosts.
-    fn process_trigger_in_runtime_hosts(
-        logger: &Logger,
-        hosts: impl Iterator<Item = Arc<T::Host>>,
-        block: Arc<EthereumBlock>,
-        trigger: EthereumTrigger,
-        state: BlockState,
-    ) -> Box<dyn Future<Item = BlockState, Error = Error> + Send>;
+        match in_handler {
+            true => handler_created_data_sources.extend(other.created_data_sources),
+            false => created_data_sources.extend(other.created_data_sources),
+        }
+        deterministic_errors.extend(other.deterministic_errors);
+        entity_cache.extend(other.entity_cache);
+        processed_data_sources.extend(other.processed_data_sources);
+        persisted_data_sources.extend(other.persisted_data_sources);
+    }
 
-    /// Adds dynamic data sources to the subgraph.
-    fn add_dynamic_data_sources(&mut self, runtime_hosts: Vec<Arc<T::Host>>) -> Result<(), Error>;
+    pub fn has_errors(&self) -> bool {
+        !self.deterministic_errors.is_empty()
+    }
+
+    pub fn has_created_data_sources(&self) -> bool {
+        assert!(!self.in_handler);
+        !self.created_data_sources.is_empty()
+    }
+
+    pub fn drain_created_data_sources(&mut self) -> Vec<DataSourceTemplateInfo<C>> {
+        assert!(!self.in_handler);
+        std::mem::take(&mut self.created_data_sources)
+    }
+
+    pub fn enter_handler(&mut self) {
+        assert!(!self.in_handler);
+        self.in_handler = true;
+        self.entity_cache.enter_handler()
+    }
+
+    pub fn exit_handler(&mut self) {
+        assert!(self.in_handler);
+        self.in_handler = false;
+        self.created_data_sources
+            .append(&mut self.handler_created_data_sources);
+        self.entity_cache.exit_handler()
+    }
+
+    pub fn exit_handler_and_discard_changes_due_to_error(&mut self, e: SubgraphError) {
+        assert!(self.in_handler);
+        self.in_handler = false;
+        self.handler_created_data_sources.clear();
+        self.entity_cache.exit_handler_and_discard_changes();
+        self.deterministic_errors.push(e);
+    }
+
+    pub fn push_created_data_source(&mut self, ds: DataSourceTemplateInfo<C>) {
+        assert!(self.in_handler);
+        self.handler_created_data_sources.push(ds);
+    }
+
+    pub fn persist_data_source(&mut self, ds: StoredDynamicDataSource) {
+        self.persisted_data_sources.push(ds)
+    }
 }

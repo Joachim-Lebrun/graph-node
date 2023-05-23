@@ -1,59 +1,29 @@
-use std::error::Error;
-use std::fmt;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use hyper;
+use hyper::service::make_service_fn;
 use hyper::Server;
 
 use crate::service::GraphQLService;
 use graph::prelude::{GraphQLServer as GraphQLServerTrait, *};
+use thiserror::Error;
 
 /// Errors that may occur when starting the server.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum GraphQLServeError {
-    BindError(hyper::Error),
-}
-
-impl Error for GraphQLServeError {
-    fn description(&self) -> &str {
-        "Failed to start the server"
-    }
-
-    fn cause(&self) -> Option<&dyn Error> {
-        None
-    }
-}
-
-impl fmt::Display for GraphQLServeError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            GraphQLServeError::BindError(e) => write!(f, "Failed to bind GraphQL server: {}", e),
-        }
-    }
-}
-
-impl From<hyper::Error> for GraphQLServeError {
-    fn from(err: hyper::Error) -> Self {
-        GraphQLServeError::BindError(err)
-    }
+    #[error("Bind error: {0}")]
+    BindError(#[from] hyper::Error),
 }
 
 /// A GraphQL server based on Hyper.
-pub struct GraphQLServer<Q, S> {
+pub struct GraphQLServer<Q> {
     logger: Logger,
     graphql_runner: Arc<Q>,
-    store: Arc<S>,
     node_id: NodeId,
 }
 
-impl<Q, S> GraphQLServer<Q, S> {
+impl<Q> GraphQLServer<Q> {
     /// Creates a new GraphQL server.
-    pub fn new(
-        logger_factory: &LoggerFactory,
-        graphql_runner: Arc<Q>,
-        store: Arc<S>,
-        node_id: NodeId,
-    ) -> Self {
+    pub fn new(logger_factory: &LoggerFactory, graphql_runner: Arc<Q>, node_id: NodeId) -> Self {
         let logger = logger_factory.component_logger(
             "GraphQLServer",
             Some(ComponentLoggerConfig {
@@ -62,20 +32,17 @@ impl<Q, S> GraphQLServer<Q, S> {
                 }),
             }),
         );
-
         GraphQLServer {
             logger,
             graphql_runner,
-            store,
             node_id,
         }
     }
 }
 
-impl<Q, S> GraphQLServerTrait for GraphQLServer<Q, S>
+impl<Q> GraphQLServerTrait for GraphQLServer<Q>
 where
     Q: GraphQlRunner,
-    S: SubgraphDeploymentStore + Store,
 {
     type ServeError = GraphQLServeError;
 
@@ -97,24 +64,21 @@ where
         // incoming queries to the query sink.
         let logger_for_service = self.logger.clone();
         let graphql_runner = self.graphql_runner.clone();
-        let store = self.store.clone();
         let node_id = self.node_id.clone();
-        let new_service = move || {
-            let service = GraphQLService::new(
+        let new_service = make_service_fn(move |_| {
+            futures03::future::ok::<_, Error>(GraphQLService::new(
                 logger_for_service.clone(),
                 graphql_runner.clone(),
-                store.clone(),
                 ws_port,
                 node_id.clone(),
-            );
-            future::ok::<GraphQLService<Q, S>, hyper::Error>(service)
-        };
+            ))
+        });
 
         // Create a task to run the server and handle HTTP requests
         let task = Server::try_bind(&addr.into())?
             .serve(new_service)
             .map_err(move |e| error!(logger, "Server error"; "error" => format!("{}", e)));
 
-        Ok(Box::new(task))
+        Ok(Box::new(task.compat()))
     }
 }

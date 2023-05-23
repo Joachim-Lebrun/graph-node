@@ -1,12 +1,12 @@
-use slog::{debug, trace, Logger};
+use crate::ext::futures::FutureExtension;
+use futures03::{Future, FutureExt, TryFutureExt};
+use slog::{debug, trace, warn, Logger};
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::prelude::*;
-use tokio::timer::timeout;
+use thiserror::Error;
 use tokio_retry::strategy::{jitter, ExponentialBackoff};
-use tokio_retry::Error as RetryError;
 use tokio_retry::Retry;
 
 /// Generic helper function for retrying async operations with built-in logging.
@@ -27,15 +27,17 @@ use tokio_retry::Retry;
 /// ```
 /// # extern crate graph;
 /// # use graph::prelude::*;
-/// # use tokio::timer::timeout;
+/// # use tokio::time::timeout;
+/// use std::future::Future;
+/// use graph::prelude::{Logger, TimeoutError};
 /// #
 /// # type Memes = (); // the memes are a lie :(
 /// #
-/// # fn download_the_memes() -> impl Future<Item=(), Error=()> {
-/// #     future::ok(())
+/// # async fn  download_the_memes() -> Result<Memes, ()> {
+/// #     Ok(())
 /// # }
 ///
-/// fn async_function(logger: Logger) -> impl Future<Item=Memes, Error=timeout::Error<()>> {
+/// fn async_function(logger: Logger) -> impl Future<Output=Result<Memes, TimeoutError<()>>> {
 ///     // Retry on error
 ///     retry("download memes", &logger)
 ///         .no_limit() // Retry forever
@@ -48,9 +50,10 @@ use tokio_retry::Retry;
 pub fn retry<I, E>(operation_name: impl ToString, logger: &Logger) -> RetryConfig<I, E> {
     RetryConfig {
         operation_name: operation_name.to_string(),
-        logger: logger.to_owned(),
+        logger: logger.clone(),
         condition: RetryIf::Error,
         log_after: 1,
+        warn_after: 10,
         limit: RetryConfigProperty::Unknown,
         phantom_item: PhantomData,
         phantom_error: PhantomData,
@@ -62,6 +65,7 @@ pub struct RetryConfig<I, E> {
     logger: Logger,
     condition: RetryIf<I, E>,
     log_after: u64,
+    warn_after: u64,
     limit: RetryConfigProperty<usize>,
     phantom_item: PhantomData<I>,
     phantom_error: PhantomData<E>,
@@ -70,7 +74,7 @@ pub struct RetryConfig<I, E> {
 impl<I, E> RetryConfig<I, E>
 where
     I: Send,
-    E: Send,
+    E: Debug + Send + Send + Sync + 'static,
 {
     /// Sets a function used to determine if a retry is needed.
     /// Note: timeouts always trigger a retry.
@@ -90,10 +94,16 @@ where
         self
     }
 
+    pub fn warn_after(mut self, min_attempts: u64) -> Self {
+        self.warn_after = min_attempts;
+        self
+    }
+
     /// Never log failed attempts.
     /// May still log at `trace` logging level.
     pub fn no_logging(mut self) -> Self {
         self.log_after = u64::max_value();
+        self.warn_after = u64::max_value();
         self
     }
 
@@ -142,19 +152,20 @@ pub struct RetryConfigWithTimeout<I, E> {
 
 impl<I, E> RetryConfigWithTimeout<I, E>
 where
-    I: Debug + Send,
-    E: Debug + Send,
+    I: Debug + Send + 'static,
+    E: Debug + Send + Send + Sync + 'static,
 {
     /// Rerun the provided function as many times as needed.
-    pub fn run<F, R>(self, try_it: F) -> impl Future<Item = I, Error = timeout::Error<E>>
+    pub fn run<F, R>(self, mut try_it: F) -> impl Future<Output = Result<I, TimeoutError<E>>>
     where
-        F: Fn() -> R + Send,
-        R: Future<Item = I, Error = E> + Send,
+        F: FnMut() -> R + Send + 'static,
+        R: Future<Output = Result<I, E>> + Send + 'static,
     {
         let operation_name = self.inner.operation_name;
         let logger = self.inner.logger.clone();
         let condition = self.inner.condition;
         let log_after = self.inner.log_after;
+        let warn_after = self.inner.warn_after;
         let limit_opt = self.inner.limit.unwrap(&operation_name, "limit");
         let timeout = self.timeout;
 
@@ -165,8 +176,15 @@ where
             logger,
             condition,
             log_after,
+            warn_after,
             limit_opt,
-            move || try_it().timeout(timeout),
+            move || {
+                try_it()
+                    .timeout(timeout)
+                    .map_err(|_| TimeoutError::Elapsed)
+                    .and_then(|res| std::future::ready(res.map_err(TimeoutError::Inner)))
+                    .boxed()
+            },
         )
     }
 }
@@ -177,17 +195,18 @@ pub struct RetryConfigNoTimeout<I, E> {
 
 impl<I, E> RetryConfigNoTimeout<I, E> {
     /// Rerun the provided function as many times as needed.
-    pub fn run<F, R>(self, try_it: F) -> impl Future<Item = I, Error = E>
+    pub fn run<F, R>(self, try_it: F) -> impl Future<Output = Result<I, E>>
     where
-        I: Debug + Send,
-        E: Debug + Send,
-        F: Fn() -> R + Send,
-        R: Future<Item = I, Error = E> + Send,
+        I: Debug + Send + 'static,
+        E: Debug + Send + Sync + 'static,
+        F: Fn() -> R + Send + 'static,
+        R: Future<Output = Result<I, E>> + Send,
     {
         let operation_name = self.inner.operation_name;
         let logger = self.inner.logger.clone();
         let condition = self.inner.condition;
         let log_after = self.inner.log_after;
+        let warn_after = self.inner.warn_after;
         let limit_opt = self.inner.limit.unwrap(&operation_name, "limit");
 
         trace!(logger, "Run with retry: {}", operation_name);
@@ -197,13 +216,10 @@ impl<I, E> RetryConfigNoTimeout<I, E> {
             logger,
             condition,
             log_after,
+            warn_after,
             limit_opt,
-            move || {
-                try_it().map_err(|e| {
-                    // No timeout, so all errors are inner errors
-                    timeout::Error::inner(e)
-                })
-            },
+            // No timeout, so all errors are inner errors
+            move || try_it().map_err(TimeoutError::Inner),
         )
         .map_err(|e| {
             // No timeout, so all errors are inner errors
@@ -212,23 +228,49 @@ impl<I, E> RetryConfigNoTimeout<I, E> {
     }
 }
 
-fn run_retry<I, E, F, R>(
+#[derive(Error, Debug)]
+pub enum TimeoutError<T: Debug + Send + Sync + 'static> {
+    #[error("{0:?}")]
+    Inner(T),
+    #[error("Timeout elapsed")]
+    Elapsed,
+}
+
+impl<T: Debug + Send + Sync + 'static> TimeoutError<T> {
+    pub fn is_elapsed(&self) -> bool {
+        match self {
+            TimeoutError::Inner(_) => false,
+            TimeoutError::Elapsed => true,
+        }
+    }
+
+    pub fn into_inner(self) -> Option<T> {
+        match self {
+            TimeoutError::Inner(x) => Some(x),
+            TimeoutError::Elapsed => None,
+        }
+    }
+}
+
+fn run_retry<O, E, F, R>(
     operation_name: String,
     logger: Logger,
-    condition: RetryIf<I, E>,
+    condition: RetryIf<O, E>,
     log_after: u64,
+    warn_after: u64,
     limit_opt: Option<usize>,
-    try_it_with_timeout: F,
-) -> impl Future<Item = I, Error = timeout::Error<E>> + Send
+    mut try_it_with_timeout: F,
+) -> impl Future<Output = Result<O, TimeoutError<E>>> + Send
 where
-    I: Debug + Send,
-    E: Debug + Send,
-    F: Fn() -> R + Send,
-    R: Future<Item = I, Error = timeout::Error<E>> + Send,
+    O: Debug + Send + 'static,
+    E: Debug + Send + Sync + 'static,
+    F: FnMut() -> R + Send + 'static,
+    R: Future<Output = Result<O, TimeoutError<E>>> + Send,
 {
     let condition = Arc::new(condition);
 
     let mut attempt_count = 0;
+
     Retry::spawn(retry_strategy(limit_opt), move || {
         let operation_name = operation_name.clone();
         let logger = logger.clone();
@@ -240,12 +282,7 @@ where
             let is_elapsed = result_with_timeout
                 .as_ref()
                 .err()
-                .map(|e| e.is_elapsed())
-                .unwrap_or(false);
-            let is_timer_err = result_with_timeout
-                .as_ref()
-                .err()
-                .map(|e| e.is_timer())
+                .map(TimeoutError::is_elapsed)
                 .unwrap_or(false);
 
             if is_elapsed {
@@ -259,11 +296,7 @@ where
                 }
 
                 // Wrap in Err to force retry
-                Err(result_with_timeout)
-            } else if is_timer_err {
-                // Should never happen
-                let timer_error = result_with_timeout.unwrap_err().into_timer().unwrap();
-                panic!("tokio timer error: {}", timer_error)
+                std::future::ready(Err(result_with_timeout))
             } else {
                 // Any error must now be an inner error.
                 // Unwrap the inner error so that the predicate doesn't need to think
@@ -272,7 +305,19 @@ where
 
                 // If needs retry
                 if condition.check(&result) {
-                    if attempt_count >= log_after {
+                    if attempt_count >= warn_after {
+                        // This looks like it would be nice to de-duplicate, but if we try
+                        // to use log! slog complains about requiring a const for the log level
+                        // See also b05e1594-e408-4047-aefb-71fc60d70e8f
+                        warn!(
+                            logger,
+                            "Trying again after {} failed (attempt #{}) with result {:?}",
+                            &operation_name,
+                            attempt_count,
+                            result
+                        );
+                    } else if attempt_count >= log_after {
+                        // See also b05e1594-e408-4047-aefb-71fc60d70e8f
                         debug!(
                             logger,
                             "Trying again after {} failed (attempt #{}) with result {:?}",
@@ -283,21 +328,21 @@ where
                     }
 
                     // Wrap in Err to force retry
-                    Err(result.map_err(timeout::Error::inner))
+                    std::future::ready(Err(result.map_err(TimeoutError::Inner)))
                 } else {
                     // Wrap in Ok to prevent retry
-                    Ok(result.map_err(timeout::Error::inner))
+                    std::future::ready(Ok(result.map_err(TimeoutError::Inner)))
                 }
             }
         })
     })
-    .then(|retry_result| {
+    .boxed()
+    .then(|retry_result| async {
         // Unwrap the inner result.
         // The outer Ok/Err is only used for retry control flow.
         match retry_result {
             Ok(r) => r,
-            Err(RetryError::OperationError(r)) => r,
-            Err(RetryError::TimerError(e)) => panic!("tokio timer error: {}", e),
+            Err(e) => e,
         }
     })
 }
@@ -382,15 +427,20 @@ where
 mod tests {
     use super::*;
 
+    use futures::future;
+    use futures03::compat::Future01CompatExt;
     use slog::o;
     use std::sync::Mutex;
 
     #[test]
     fn test() {
         let logger = Logger::root(::slog::Discard, o!());
-        let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
 
-        let result = runtime.block_on(future::lazy(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(async {
             let c = Mutex::new(0);
             retry("test", &logger)
                 .no_logging()
@@ -401,21 +451,25 @@ mod tests {
                     *c_guard += 1;
 
                     if *c_guard >= 10 {
-                        future::ok(*c_guard)
+                        future::ok(*c_guard).compat()
                     } else {
-                        future::err(())
+                        future::err(()).compat()
                     }
                 })
-        }));
+                .await
+        });
         assert_eq!(result, Ok(10));
     }
 
     #[test]
     fn limit_reached() {
         let logger = Logger::root(::slog::Discard, o!());
-        let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-        let result = runtime.block_on(future::lazy(move || {
+        let result = runtime.block_on({
             let c = Mutex::new(0);
             retry("test", &logger)
                 .no_logging()
@@ -426,21 +480,24 @@ mod tests {
                     *c_guard += 1;
 
                     if *c_guard >= 10 {
-                        future::ok(*c_guard)
+                        future::ok(*c_guard).compat()
                     } else {
-                        future::err(*c_guard)
+                        future::err(*c_guard).compat()
                     }
                 })
-        }));
+        });
         assert_eq!(result, Err(5));
     }
 
     #[test]
     fn limit_not_reached() {
         let logger = Logger::root(::slog::Discard, o!());
-        let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-        let result = runtime.block_on(future::lazy(move || {
+        let result = runtime.block_on({
             let c = Mutex::new(0);
             retry("test", &logger)
                 .no_logging()
@@ -451,23 +508,25 @@ mod tests {
                     *c_guard += 1;
 
                     if *c_guard >= 10 {
-                        future::ok(*c_guard)
+                        future::ok(*c_guard).compat()
                     } else {
-                        future::err(*c_guard)
+                        future::err(*c_guard).compat()
                     }
                 })
-        }));
+        });
         assert_eq!(result, Ok(10));
     }
 
     #[test]
     fn custom_when() {
         let logger = Logger::root(::slog::Discard, o!());
-        let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
+        let c = Mutex::new(0);
 
-        let result = runtime.block_on(future::lazy(move || {
-            let c = Mutex::new(0);
-
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on({
             retry("test", &logger)
                 .when(|result| result.unwrap() < 10)
                 .no_logging()
@@ -477,24 +536,13 @@ mod tests {
                     let mut c_guard = c.lock().unwrap();
                     *c_guard += 1;
                     if *c_guard > 30 {
-                        future::err(())
+                        future::err(()).compat()
                     } else {
-                        future::ok(*c_guard)
+                        future::ok(*c_guard).compat()
                     }
                 })
-        }));
+        });
+
         assert_eq!(result, Ok(10));
     }
-}
-
-/// Convenient way to annotate a future with `tokio_threadpool::blocking`.
-///
-/// Panics if called from outside a tokio runtime.
-pub fn blocking<T, E>(mut f: impl Future<Item = T, Error = E>) -> impl Future<Item = T, Error = E> {
-    future::poll_fn(move || match tokio_threadpool::blocking(|| f.poll()) {
-        Ok(Async::NotReady) | Ok(Async::Ready(Ok(Async::NotReady))) => Ok(Async::NotReady),
-        Ok(Async::Ready(Ok(Async::Ready(t)))) => Ok(Async::Ready(t)),
-        Ok(Async::Ready(Err(e))) => Err(e),
-        Err(_) => panic!("not inside a tokio thread pool"),
-    })
 }

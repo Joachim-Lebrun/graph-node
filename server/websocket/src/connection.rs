@@ -1,26 +1,14 @@
-use futures::future::IntoFuture;
-use futures::stream::SplitStream;
 use futures::sync::mpsc;
+use futures03::stream::SplitStream;
 use graphql_parser::parse_query;
-use lazy_static::lazy_static;
+use http::StatusCode;
 use std::collections::HashMap;
-use std::env;
-use std::str::FromStr;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
-use graph::prelude::serde_json;
-use graph::prelude::*;
-
-lazy_static! {
-    static ref MAX_OPERATIONS_PER_CONNECTION: Option<usize> =
-        env::var("GRAPH_GRAPHQL_MAX_OPERATIONS_PER_CONNECTION")
-            .ok()
-            .map(|s| usize::from_str(&s).unwrap_or_else(|_| panic!(
-                "failed to parse env var GRAPH_GRAPHQL_MAX_OPERATIONS_PER_CONNECTION"
-            )));
-}
+use graph::{data::query::QueryTarget, prelude::*};
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,19 +22,28 @@ struct StartPayload {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum IncomingMessage {
-    ConnectionInit { payload: Option<serde_json::Value> },
+    ConnectionInit {
+        #[allow(dead_code)]
+        payload: Option<serde_json::Value>,
+    },
     ConnectionTerminate,
-    Start { id: String, payload: StartPayload },
-    Stop { id: String },
+    Start {
+        id: String,
+        payload: StartPayload,
+    },
+    Stop {
+        id: String,
+    },
 }
 
 impl IncomingMessage {
     pub fn from_ws_message(msg: WsMessage) -> Result<Self, WsError> {
         let text = msg.into_text()?;
         serde_json::from_str(text.as_str()).map_err(|e| {
-            WsError::Protocol(
-                format!("Invalid GraphQL over WebSocket message: {}: {}", text, e).into(),
-            )
+            WsError::Http(http::Response::new(Some(format!(
+                "Invalid GraphQL over WebSocket message: {}: {}",
+                text, e
+            ))))
         })
     }
 }
@@ -56,15 +53,23 @@ impl IncomingMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum OutgoingMessage {
     ConnectionAck,
-    Error { id: String, payload: String },
-    Data { id: String, payload: QueryResult },
-    Complete { id: String },
+    Error {
+        id: String,
+        payload: String,
+    },
+    Data {
+        id: String,
+        payload: Arc<QueryResult>,
+    },
+    Complete {
+        id: String,
+    },
 }
 
 impl OutgoingMessage {
-    pub fn from_query_result(id: String, result: QueryResult) -> Self {
+    pub fn from_query_result(id: String, result: Arc<QueryResult>) -> Self {
         OutgoingMessage::Data {
-            id: id,
+            id,
             payload: result,
         }
     }
@@ -85,8 +90,11 @@ fn send_message(
     sink: &mpsc::UnboundedSender<WsMessage>,
     msg: OutgoingMessage,
 ) -> Result<(), WsError> {
-    sink.unbounded_send(msg.into())
-        .map_err(|_| WsError::Http(500))
+    sink.unbounded_send(msg.into()).map_err(|_| {
+        let mut response = http::Response::new(None);
+        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        WsError::Http(response)
+    })
 }
 
 /// Helper function to send error messages.
@@ -96,7 +104,11 @@ fn send_error_string(
     error: String,
 ) -> Result<(), WsError> {
     sink.unbounded_send(OutgoingMessage::from_error_string(operation_id, error).into())
-        .map_err(|_| WsError::Http(500))
+        .map_err(|_| {
+            let mut response = http::Response::new(None);
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            WsError::Http(response)
+        })
 }
 
 /// Responsible for recording operation ids and stopping them.
@@ -162,18 +174,18 @@ pub struct GraphQlConnection<Q, S> {
     logger: Logger,
     graphql_runner: Arc<Q>,
     stream: WebSocketStream<S>,
-    schema: Arc<Schema>,
+    deployment: DeploymentHash,
 }
 
 impl<Q, S> GraphQlConnection<Q, S>
 where
     Q: GraphQlRunner,
-    S: AsyncRead + AsyncWrite + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + 'static + Unpin,
 {
     /// Creates a new GraphQL subscription service.
     pub(crate) fn new(
         logger: &Logger,
-        schema: Arc<Schema>,
+        deployment: DeploymentHash,
         stream: WebSocketStream<S>,
         graphql_runner: Arc<Q>,
     ) -> Self {
@@ -182,22 +194,22 @@ where
             logger: logger.new(o!("component" => "GraphQlConnection")),
             graphql_runner,
             stream,
-            schema,
+            deployment,
         }
     }
 
-    fn handle_incoming_messages(
-        ws_stream: SplitStream<WebSocketStream<S>>,
+    async fn handle_incoming_messages(
+        mut ws_stream: SplitStream<WebSocketStream<S>>,
         mut msg_sink: mpsc::UnboundedSender<WsMessage>,
         logger: Logger,
         connection_id: String,
-        schema: Arc<Schema>,
+        deployment: DeploymentHash,
         graphql_runner: Arc<Q>,
-    ) -> impl Future<Item = (), Error = WsError> {
+    ) -> Result<(), WsError> {
         let mut operations = Operations::new(msg_sink.clone());
 
         // Process incoming messages as long as the WebSocket is open
-        ws_stream.for_each(move |ws_msg| {
+        while let Some(ws_msg) = ws_stream.try_next().await? {
             use self::IncomingMessage::*;
             use self::OutgoingMessage::*;
 
@@ -221,7 +233,7 @@ where
                     msg_sink.close().unwrap();
 
                     // Return an error here to terminate the connection
-                    Err(WsError::ConnectionClosed(None))
+                    Err(WsError::ConnectionClosed)
                 }
 
                 // When receiving a stop request
@@ -238,27 +250,23 @@ where
                         );
                     }
 
-                    if let Some(max_ops) = *MAX_OPERATIONS_PER_CONNECTION {
-                        if operations.operations.len() >= max_ops {
-                            return send_error_string(
-                                &msg_sink,
-                                id.clone(),
-                                format!(
-                                    "Reached the limit of {} operations per connection",
-                                    max_ops
-                                ),
-                            );
-                        }
+                    let max_ops = ENV_VARS.graphql.max_operations_per_connection;
+                    if operations.operations.len() >= max_ops {
+                        return send_error_string(
+                            &msg_sink,
+                            id,
+                            format!("Reached the limit of {} operations per connection", max_ops),
+                        );
                     }
 
                     // Parse the GraphQL query document; respond with a GQL_ERROR if
                     // the query is invalid
                     let query = match parse_query(&payload.query) {
-                        Ok(query) => query,
+                        Ok(query) => query.into_static(),
                         Err(e) => {
                             return send_error_string(
                                 &msg_sink,
-                                id.clone(),
+                                id,
                                 format!("Invalid query: {}: {}", payload.query, e),
                             );
                         }
@@ -273,7 +281,7 @@ where
                                 Err(e) => {
                                     return send_error_string(
                                         &msg_sink,
-                                        id.clone(),
+                                        id,
                                         format!("Invalid variables provided: {}", e),
                                     );
                                 }
@@ -282,19 +290,18 @@ where
                         _ => {
                             return send_error_string(
                                 &msg_sink,
-                                id.clone(),
-                                format!("Invalid variables provided (must be an object)"),
+                                id,
+                                "Invalid variables provided (must be an object)".to_string(),
                             );
                         }
                     };
 
                     // Construct a subscription
+                    let target = QueryTarget::Deployment(deployment.clone(), Default::default());
                     let subscription = Subscription {
-                        query: Query {
-                            schema: schema.clone(),
-                            document: query,
-                            variables,
-                        },
+                        // Subscriptions currently do not benefit from the generational cache
+                        // anyways, so don't bother passing a network.
+                        query: Query::new(query, variables, false),
                     };
 
                     debug!(logger, "Start operation";
@@ -302,7 +309,6 @@ where
                            "id" => &id);
 
                     // Execute the GraphQL subscription
-                    let graphql_runner = graphql_runner.clone();
                     let error_sink = msg_sink.clone();
                     let result_sink = msg_sink.clone();
                     let result_id = id.clone();
@@ -310,7 +316,9 @@ where
                     let err_connection_id = connection_id.clone();
                     let err_logger = logger.clone();
                     let run_subscription = graphql_runner
-                        .run_subscription(subscription)
+                        .cheap_clone()
+                        .run_subscription(subscription, target)
+                        .compat()
                         .map_err(move |e| {
                             debug!(err_logger, "Subscription error";
                                                "connection" => &err_connection_id,
@@ -320,10 +328,22 @@ where
                             // Send errors back to the client as GQL_DATA
                             match e {
                                 SubscriptionError::GraphQLError(e) => {
-                                    let result = QueryResult::from(e);
-                                    let msg =
-                                        OutgoingMessage::from_query_result(err_id.clone(), result);
-                                    error_sink.unbounded_send(msg.into()).unwrap();
+                                    // Don't bug clients with transient `TooExpensive` errors,
+                                    // simply skip updating them
+                                    if !e
+                                        .iter()
+                                        .any(|err| matches!(err, QueryExecutionError::TooExpensive))
+                                    {
+                                        let result = Arc::new(QueryResult::from(e));
+                                        let msg = OutgoingMessage::from_query_result(
+                                            err_id.clone(),
+                                            result,
+                                        );
+
+                                        // An error means the client closed the websocket, ignore
+                                        // and let it be handled in the websocket loop above.
+                                        let _ = error_sink.unbounded_send(msg.into());
+                                    }
                                 }
                             };
                         })
@@ -334,6 +354,8 @@ where
                                     OutgoingMessage::from_query_result(result_id.clone(), result)
                                 })
                                 .map(WsMessage::from)
+                                .map(Ok)
+                                .compat()
                                 .forward(result_sink.sink_map_err(|_| ()))
                                 .map(|_| ())
                         });
@@ -343,25 +365,28 @@ where
                     let logger = logger.clone();
                     let cancel_id = id.clone();
                     let connection_id = connection_id.clone();
-                    let run_subscription = run_subscription.cancelable(&guard, move || {
-                        debug!(logger, "Stopped operation";
+                    let run_subscription =
+                        run_subscription.compat().cancelable(&guard, move || {
+                            debug!(logger, "Stopped operation";
                                        "connection" => &connection_id,
-                                       "id" => &cancel_id)
-                    });
+                                       "id" => &cancel_id);
+                            Ok(())
+                        });
                     operations.insert(id, guard);
 
-                    tokio::spawn(run_subscription);
+                    graph::spawn_allow_panic(run_subscription);
                     Ok(())
                 }
-            }
-        })
+            }?
+        }
+        Ok(())
     }
 }
 
 impl<Q, S> IntoFuture for GraphQlConnection<Q, S>
 where
     Q: GraphQlRunner,
-    S: AsyncRead + AsyncWrite + Send + 'static,
+    S: AsyncRead + AsyncWrite + Send + 'static + Unpin,
 {
     type Future = Box<dyn Future<Item = Self::Item, Error = Self::Error> + Send>;
     type Item = ();
@@ -382,25 +407,25 @@ where
             msg_sink,
             self.logger.clone(),
             self.id.clone(),
-            self.schema.clone(),
+            self.deployment.clone(),
             self.graphql_runner.clone(),
         );
 
         // Send outgoing messages asynchronously
-        let ws_writer = msg_stream.forward(ws_sink.sink_map_err(|_| ()));
+        let ws_writer = msg_stream.forward(ws_sink.compat().sink_map_err(|_| ()));
 
         // Silently swallow internal send results and errors. There is nothing
         // we can do about these errors ourselves. Clients will be disconnected
         // as a result of this but most will try to reconnect (GraphiQL for sure,
         // Apollo maybe).
         let ws_writer = ws_writer.map(|_| ());
-        let ws_reader = ws_reader.map(|_| ()).map_err(|_| ());
+        let ws_reader = Box::pin(ws_reader.map_err(|_| ()));
 
         // Return a future that is fulfilled when either we or the client close
         // our/their end of the WebSocket stream
         let logger = self.logger.clone();
         let id = self.id.clone();
-        Box::new(ws_reader.select(ws_writer).then(move |_| {
+        Box::new(ws_reader.compat().select(ws_writer).then(move |_| {
             debug!(logger, "GraphQL over WebSocket connection closed"; "connection" => id);
             Ok(())
         }))

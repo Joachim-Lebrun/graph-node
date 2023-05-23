@@ -1,35 +1,59 @@
-use ethabi::Contract;
-use failure;
-use failure::{Error, SyncFailure};
-use futures::stream;
-use parity_wasm;
-use parity_wasm::elements::Module;
-use serde::de;
-use serde::ser;
+/// Rust representation of the GraphQL schema for a `SubgraphManifest`.
+pub mod schema;
+
+/// API version and spec version.
+pub mod api_version;
+pub use api_version::*;
+
+pub mod features;
+pub mod status;
+
+pub use features::{SubgraphFeature, SubgraphFeatureValidationError};
+
+use anyhow::{anyhow, Context, Error};
+use futures03::{future::try_join3, stream::FuturesOrdered, TryStreamExt as _};
+use semver::Version;
+use serde::{de, ser};
 use serde_yaml;
-use slog::{info, Logger};
+use slog::Logger;
+use stable_hash::{FieldAddress, StableHash};
+use stable_hash_legacy::SequenceNumber;
+use std::{
+    collections::{BTreeSet, HashMap},
+    marker::PhantomData,
+};
+use thiserror::Error;
+use wasmparser;
+use web3::types::Address;
+
+use crate::{
+    bail,
+    blockchain::{BlockPtr, Blockchain, DataSource as _},
+    components::{
+        link_resolver::LinkResolver,
+        store::{StoreError, SubgraphStore},
+    },
+    data::{
+        graphql::TryFromValue, query::QueryExecutionError,
+        subgraph::features::validate_subgraph_features,
+    },
+    data_source::{
+        offchain::OFFCHAIN_KINDS, DataSource, DataSourceTemplate, UnresolvedDataSource,
+        UnresolvedDataSourceTemplate,
+    },
+    ensure,
+    prelude::{r, CheapClone, Value, ENV_VARS},
+    schema::{InputSchema, SchemaValidationError},
+};
+
+use crate::prelude::{impl_slog_value, BlockNumber, Deserialize, Serialize};
+
 use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::prelude::*;
-use web3::types::{Address, H256};
 
-use crate::components::link_resolver::LinkResolver;
-use crate::components::store::StoreError;
-use crate::data::query::QueryExecutionError;
-use crate::data::schema::Schema;
-use crate::data::subgraph::schema::{
-    EthereumBlockHandlerEntity, EthereumCallHandlerEntity, EthereumContractAbiEntity,
-    EthereumContractDataSourceEntity, EthereumContractDataSourceTemplateEntity,
-    EthereumContractDataSourceTemplateSourceEntity, EthereumContractEventHandlerEntity,
-    EthereumContractMappingEntity, EthereumContractSourceEntity, SUBGRAPHS_ID,
-};
-use crate::prelude::{format_err, Deserialize, Fail, Serialize};
-use crate::util::ethereum::string_to_h256;
-
-/// Rust representation of the GraphQL schema for a `SubgraphManifest`.
-pub mod schema;
+use super::value::Word;
 
 /// Deserialize an Address (with or without '0x' prefix).
 fn deserialize_address<'de, D>(deserializer: D) -> Result<Option<Address>, D::Error>
@@ -42,27 +66,62 @@ where
     let address = s.trim_start_matches("0x");
     Address::from_str(address)
         .map_err(D::Error::custom)
-        .map(|addr| Some(addr))
+        .map(Some)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SubgraphDeploymentId(String);
+/// The IPFS hash used to identifiy a deployment externally, i.e., the
+/// `Qm..` string that `graph-cli` prints when deploying to a subgraph
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct DeploymentHash(String);
 
-impl SubgraphDeploymentId {
-    pub fn new(s: impl Into<String>) -> Result<Self, ()> {
+impl stable_hash_legacy::StableHash for DeploymentHash {
+    #[inline]
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        mut sequence_number: H::Seq,
+        state: &mut H,
+    ) {
+        let Self(inner) = self;
+        stable_hash_legacy::StableHash::stable_hash(inner, sequence_number.next_child(), state);
+    }
+}
+
+impl StableHash for DeploymentHash {
+    fn stable_hash<H: stable_hash::StableHasher>(&self, field_address: H::Addr, state: &mut H) {
+        let Self(inner) = self;
+        stable_hash::StableHash::stable_hash(inner, field_address.child(0), state);
+    }
+}
+
+impl_slog_value!(DeploymentHash);
+
+/// `DeploymentHash` is fixed-length so cheap to clone.
+impl CheapClone for DeploymentHash {}
+
+impl DeploymentHash {
+    /// Check that `s` is a valid `SubgraphDeploymentId` and create a new one.
+    /// If `s` is longer than 46 characters, or contains characters other than
+    /// alphanumeric characters or `_`, return s (as a `String`) as the error
+    pub fn new(s: impl Into<String>) -> Result<Self, String> {
         let s = s.into();
 
         // Enforce length limit
         if s.len() > 46 {
-            return Err(());
+            return Err(s);
         }
 
         // Check that the ID contains only allowed characters.
-        if !s.chars().all(|c| c.is_ascii_alphanumeric()) {
-            return Err(());
+        if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(s);
         }
 
-        Ok(SubgraphDeploymentId(s))
+        // Allow only deployment id's for 'real' subgraphs, not the old
+        // metadata subgraph.
+        if s == "subgraphs" {
+            return Err(s);
+        }
+
+        Ok(DeploymentHash(s))
     }
 
     pub fn to_ipfs_link(&self) -> Link {
@@ -70,15 +129,9 @@ impl SubgraphDeploymentId {
             link: format!("/ipfs/{}", self),
         }
     }
-
-    /// Return true if this is the id of the special
-    /// "subgraph of subgraphs" that contains metadata about everything
-    pub fn is_meta(&self) -> bool {
-        self.0 == *SUBGRAPHS_ID.0
-    }
 }
 
-impl Deref for SubgraphDeploymentId {
+impl Deref for DeploymentHash {
     type Target = String;
 
     fn deref(&self) -> &Self::Target {
@@ -86,13 +139,13 @@ impl Deref for SubgraphDeploymentId {
     }
 }
 
-impl fmt::Display for SubgraphDeploymentId {
+impl fmt::Display for DeploymentHash {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         self.0.fmt(f)
     }
 }
 
-impl ser::Serialize for SubgraphDeploymentId {
+impl ser::Serialize for DeploymentHash {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: ser::Serializer,
@@ -101,14 +154,21 @@ impl ser::Serialize for SubgraphDeploymentId {
     }
 }
 
-impl<'de> de::Deserialize<'de> for SubgraphDeploymentId {
+impl<'de> de::Deserialize<'de> for DeploymentHash {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: de::Deserializer<'de>,
     {
         let s: String = de::Deserialize::deserialize(deserializer)?;
-        SubgraphDeploymentId::new(s.clone())
-            .map_err(|()| de::Error::invalid_value(de::Unexpected::Str(&s), &"valid subgraph name"))
+        DeploymentHash::new(s)
+            .map_err(|s| de::Error::invalid_value(de::Unexpected::Str(&s), &"valid subgraph name"))
+    }
+}
+
+impl TryFromValue for DeploymentHash {
+    fn try_from_value(value: &r::Value) -> Result<Self, Error> {
+        Self::new(String::try_from_value(value)?)
+            .map_err(|s| anyhow!("Invalid subgraph ID `{}`", s))
     }
 }
 
@@ -136,9 +196,9 @@ impl SubgraphName {
         }
 
         // Parse into components and validate each
-        for part in s.split("/") {
-            // Each part must be non-empty and not too long
-            if part.is_empty() || part.len() > 32 {
+        for part in s.split('/') {
+            // Each part must be non-empty
+            if part.is_empty() {
                 return Err(());
             }
 
@@ -159,6 +219,16 @@ impl SubgraphName {
         }
 
         Ok(SubgraphName(s))
+    }
+
+    /// Tests are allowed to create arbitrary subgraph names
+    #[cfg(debug_assertions)]
+    pub fn new_unchecked(s: impl Into<String>) -> Self {
+        SubgraphName(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
@@ -188,6 +258,600 @@ impl<'de> de::Deserialize<'de> for SubgraphName {
     }
 }
 
+/// Result of a creating a subgraph in the registar.
+#[derive(Serialize)]
+pub struct CreateSubgraphResult {
+    /// The ID of the subgraph that was created.
+    pub id: String,
+}
+
+#[derive(Error, Debug)]
+pub enum SubgraphRegistrarError {
+    #[error("subgraph resolve error: {0}")]
+    ResolveError(SubgraphManifestResolveError),
+    #[error("subgraph already exists: {0}")]
+    NameExists(String),
+    #[error("subgraph name not found: {0}")]
+    NameNotFound(String),
+    #[error("network not supported by registrar: {0}")]
+    NetworkNotSupported(Error),
+    #[error("deployment not found: {0}")]
+    DeploymentNotFound(String),
+    #[error("deployment assignment unchanged: {0}")]
+    DeploymentAssignmentUnchanged(String),
+    #[error("subgraph registrar internal query error: {0}")]
+    QueryExecutionError(#[from] QueryExecutionError),
+    #[error("subgraph registrar error with store: {0}")]
+    StoreError(StoreError),
+    #[error("subgraph validation error: {}", display_vector(.0))]
+    ManifestValidationError(Vec<SubgraphManifestValidationError>),
+    #[error("subgraph deployment error: {0}")]
+    SubgraphDeploymentError(StoreError),
+    #[error("subgraph registrar error: {0}")]
+    Unknown(#[from] anyhow::Error),
+}
+
+impl From<StoreError> for SubgraphRegistrarError {
+    fn from(e: StoreError) -> Self {
+        match e {
+            StoreError::DeploymentNotFound(id) => SubgraphRegistrarError::DeploymentNotFound(id),
+            e => SubgraphRegistrarError::StoreError(e),
+        }
+    }
+}
+
+impl From<SubgraphManifestValidationError> for SubgraphRegistrarError {
+    fn from(e: SubgraphManifestValidationError) -> Self {
+        SubgraphRegistrarError::ManifestValidationError(vec![e])
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum SubgraphAssignmentProviderError {
+    #[error("Subgraph resolve error: {0}")]
+    ResolveError(Error),
+    /// Occurs when attempting to remove a subgraph that's not hosted.
+    #[error("Subgraph with ID {0} already running")]
+    AlreadyRunning(DeploymentHash),
+    #[error("Subgraph provider error: {0}")]
+    Unknown(#[from] anyhow::Error),
+}
+
+impl From<::diesel::result::Error> for SubgraphAssignmentProviderError {
+    fn from(e: ::diesel::result::Error) -> Self {
+        SubgraphAssignmentProviderError::Unknown(e.into())
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum SubgraphManifestValidationError {
+    #[error("subgraph has no data sources")]
+    NoDataSources,
+    #[error("subgraph source address is required")]
+    SourceAddressRequired,
+    #[error("subgraph cannot index data from different Ethereum networks")]
+    MultipleEthereumNetworks,
+    #[error("subgraph must have at least one Ethereum network data source")]
+    EthereumNetworkRequired,
+    #[error("the specified block must exist on the Ethereum network")]
+    BlockNotFound(String),
+    #[error("schema validation failed: {0:?}")]
+    SchemaValidationError(Vec<SchemaValidationError>),
+    #[error("the graft base is invalid: {0}")]
+    GraftBaseInvalid(String),
+    #[error("subgraph must use a single apiVersion across its data sources. Found: {}", format_versions(&(.0).0))]
+    DifferentApiVersions(#[from] DifferentMappingApiVersions),
+    #[error(transparent)]
+    FeatureValidationError(#[from] SubgraphFeatureValidationError),
+    #[error("data source {0} is invalid: {1}")]
+    DataSourceValidation(String, Error),
+}
+
+#[derive(Error, Debug)]
+pub enum SubgraphManifestResolveError {
+    #[error("parse error: {0}")]
+    ParseError(#[from] serde_yaml::Error),
+    #[error("subgraph is not UTF-8")]
+    NonUtf8,
+    #[error("subgraph is not valid YAML")]
+    InvalidFormat,
+    #[error("resolve error: {0}")]
+    ResolveError(#[from] anyhow::Error),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataSourceContext(HashMap<Word, Value>);
+
+impl DataSourceContext {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    // This collects the entries into an ordered vector so that it can be iterated deterministically.
+    pub fn sorted(self) -> Vec<(Word, Value)> {
+        let mut v: Vec<_> = self.0.into_iter().collect();
+        v.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+        v
+    }
+}
+
+impl From<HashMap<Word, Value>> for DataSourceContext {
+    fn from(map: HashMap<Word, Value>) -> Self {
+        Self(map)
+    }
+}
+
+/// IPLD link.
+#[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
+pub struct Link {
+    #[serde(rename = "/")]
+    pub link: String,
+}
+
+impl<S: ToString> From<S> for Link {
+    fn from(s: S) -> Self {
+        Self {
+            link: s.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+pub struct UnresolvedSchema {
+    pub file: Link,
+}
+
+impl UnresolvedSchema {
+    pub async fn resolve(
+        self,
+        id: DeploymentHash,
+        resolver: &Arc<dyn LinkResolver>,
+        logger: &Logger,
+    ) -> Result<InputSchema, anyhow::Error> {
+        let schema_bytes = resolver
+            .cat(logger, &self.file)
+            .await
+            .with_context(|| format!("failed to resolve schema {}", &self.file.link))?;
+        InputSchema::parse(&String::from_utf8(schema_bytes)?, id)
+    }
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+pub struct Source {
+    /// The contract address for the data source. We allow data sources
+    /// without an address for 'wildcard' triggers that catch all possible
+    /// events with the given `abi`
+    #[serde(default, deserialize_with = "deserialize_address")]
+    pub address: Option<Address>,
+    pub abi: String,
+    #[serde(rename = "startBlock", default)]
+    pub start_block: BlockNumber,
+}
+
+pub fn calls_host_fn(runtime: &[u8], host_fn: &str) -> anyhow::Result<bool> {
+    use wasmparser::Payload;
+
+    for payload in wasmparser::Parser::new(0).parse_all(runtime) {
+        if let Payload::ImportSection(s) = payload? {
+            for import in s {
+                let import = import?;
+                if import.field == Some(host_fn) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Graft {
+    pub base: DeploymentHash,
+    pub block: BlockNumber,
+}
+
+impl Graft {
+    async fn validate<S: SubgraphStore>(
+        &self,
+        store: Arc<S>,
+    ) -> Result<(), SubgraphManifestValidationError> {
+        use SubgraphManifestValidationError::*;
+
+        let last_processed_block = store
+            .least_block_ptr(&self.base)
+            .await
+            .map_err(|e| GraftBaseInvalid(e.to_string()))?;
+        let is_base_healthy = store
+            .is_healthy(&self.base)
+            .await
+            .map_err(|e| GraftBaseInvalid(e.to_string()))?;
+
+        // We are being defensive here: we don't know which specific
+        // instance of a subgraph we will use as the base for the graft,
+        // since the notion of which of these instances is active can change
+        // between this check and when the graft actually happens when the
+        // subgraph is started. We therefore check that any instance of the
+        // base subgraph is suitable.
+        match (last_processed_block, is_base_healthy) {
+            (None, _) => Err(GraftBaseInvalid(format!(
+                "failed to graft onto `{}` since it has not processed any blocks",
+                self.base
+            ))),
+            (Some(ptr), true) if ptr.number < self.block => Err(GraftBaseInvalid(format!(
+                "failed to graft onto `{}` at block {} since it has only processed block {}",
+                self.base, self.block, ptr.number
+            ))),
+            // If the base deployment is failed *and* the `graft.block` is not
+            // less than the `base.block`, the graft shouldn't be permitted.
+            //
+            // The developer should change their `graft.block` in the manifest
+            // to `base.block - 1` or less.
+            (Some(ptr), false) if self.block >= ptr.number => Err(GraftBaseInvalid(format!(
+                "failed to graft onto `{}` at block {} since it's not healthy. You can graft it starting at block {} backwards",
+                self.base, self.block, ptr.number - 1
+            ))),
+            (Some(_), _) => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BaseSubgraphManifest<C, S, D, T> {
+    pub id: DeploymentHash,
+    pub spec_version: Version,
+    #[serde(default)]
+    pub features: BTreeSet<SubgraphFeature>,
+    pub description: Option<String>,
+    pub repository: Option<String>,
+    pub schema: S,
+    pub data_sources: Vec<D>,
+    pub graft: Option<Graft>,
+    #[serde(default)]
+    pub templates: Vec<T>,
+    #[serde(skip_serializing, default)]
+    pub chain: PhantomData<C>,
+}
+
+/// SubgraphManifest with IPFS links unresolved
+pub type UnresolvedSubgraphManifest<C> = BaseSubgraphManifest<
+    C,
+    UnresolvedSchema,
+    UnresolvedDataSource<C>,
+    UnresolvedDataSourceTemplate<C>,
+>;
+
+/// SubgraphManifest validated with IPFS links resolved
+pub type SubgraphManifest<C> =
+    BaseSubgraphManifest<C, InputSchema, DataSource<C>, DataSourceTemplate<C>>;
+
+/// Unvalidated SubgraphManifest
+pub struct UnvalidatedSubgraphManifest<C: Blockchain>(SubgraphManifest<C>);
+
+impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
+    /// Entry point for resolving a subgraph definition.
+    /// Right now the only supported links are of the form:
+    /// `/ipfs/QmUmg7BZC1YP1ca66rRtWKxpXp77WgVHrnv263JtDuvs2k`
+    pub async fn resolve(
+        id: DeploymentHash,
+        raw: serde_yaml::Mapping,
+        resolver: &Arc<dyn LinkResolver>,
+        logger: &Logger,
+        max_spec_version: semver::Version,
+    ) -> Result<Self, SubgraphManifestResolveError> {
+        Ok(Self(
+            SubgraphManifest::resolve_from_raw(id, raw, resolver, logger, max_spec_version).await?,
+        ))
+    }
+
+    /// Validates the subgraph manifest file.
+    ///
+    /// Graft base validation will be skipped if the parameter `validate_graft_base` is false.
+    pub async fn validate<S: SubgraphStore>(
+        self,
+        store: Arc<S>,
+        validate_graft_base: bool,
+    ) -> Result<SubgraphManifest<C>, Vec<SubgraphManifestValidationError>> {
+        let mut errors: Vec<SubgraphManifestValidationError> = vec![];
+
+        // Validate that the manifest has at least one data source
+        if self.0.data_sources.is_empty() {
+            errors.push(SubgraphManifestValidationError::NoDataSources);
+        }
+
+        for ds in &self.0.data_sources {
+            errors.extend(ds.validate().into_iter().map(|e| {
+                SubgraphManifestValidationError::DataSourceValidation(ds.name().to_owned(), e)
+            }));
+        }
+
+        // For API versions newer than 0.0.5, validate that all mappings uses the same api_version
+        if let Err(different_api_versions) = self.0.unified_mapping_api_version() {
+            errors.push(different_api_versions.into());
+        };
+
+        let mut networks = self
+            .0
+            .data_sources
+            .iter()
+            .filter_map(|d| Some(d.as_onchain()?.network()?.to_string()))
+            .collect::<Vec<String>>();
+        networks.sort();
+        networks.dedup();
+        match networks.len() {
+            0 => errors.push(SubgraphManifestValidationError::EthereumNetworkRequired),
+            1 => (),
+            _ => errors.push(SubgraphManifestValidationError::MultipleEthereumNetworks),
+        }
+
+        self.0
+            .schema
+            .validate()
+            .err()
+            .into_iter()
+            .for_each(|schema_errors| {
+                errors.push(SubgraphManifestValidationError::SchemaValidationError(
+                    schema_errors,
+                ));
+            });
+
+        if let Some(graft) = &self.0.graft {
+            if validate_graft_base {
+                if let Err(graft_err) = graft.validate(store).await {
+                    errors.push(graft_err);
+                }
+            }
+        }
+
+        // Validate subgraph feature usage and declaration.
+        if self.0.spec_version >= SPEC_VERSION_0_0_4 {
+            if let Err(feature_validation_error) = validate_subgraph_features(&self.0) {
+                errors.push(feature_validation_error.into())
+            }
+        }
+
+        match errors.is_empty() {
+            true => Ok(self.0),
+            false => Err(errors),
+        }
+    }
+
+    pub fn spec_version(&self) -> &Version {
+        &self.0.spec_version
+    }
+}
+
+impl<C: Blockchain> SubgraphManifest<C> {
+    /// Entry point for resolving a subgraph definition.
+    pub async fn resolve_from_raw(
+        id: DeploymentHash,
+        raw: serde_yaml::Mapping,
+        resolver: &Arc<dyn LinkResolver>,
+        logger: &Logger,
+        max_spec_version: semver::Version,
+    ) -> Result<Self, SubgraphManifestResolveError> {
+        let unresolved = UnresolvedSubgraphManifest::parse(id, raw)?;
+
+        let resolved = unresolved
+            .resolve(resolver, logger, max_spec_version)
+            .await?;
+
+        Ok(resolved)
+    }
+
+    pub fn network_name(&self) -> String {
+        // Assume the manifest has been validated, ensuring network names are homogenous
+        self.data_sources
+            .iter()
+            .find_map(|d| Some(d.as_onchain()?.network()?.to_string()))
+            .expect("Validated manifest does not have a network defined on any datasource")
+    }
+
+    pub fn start_blocks(&self) -> Vec<BlockNumber> {
+        self.data_sources
+            .iter()
+            .filter_map(|d| Some(d.as_onchain()?.start_block()))
+            .collect()
+    }
+
+    pub fn api_versions(&self) -> impl Iterator<Item = semver::Version> + '_ {
+        self.templates
+            .iter()
+            .map(|template| template.api_version())
+            .chain(self.data_sources.iter().map(|source| source.api_version()))
+    }
+
+    pub fn runtimes(&self) -> impl Iterator<Item = Arc<Vec<u8>>> + '_ {
+        self.templates
+            .iter()
+            .filter_map(|template| template.runtime())
+            .chain(
+                self.data_sources
+                    .iter()
+                    .filter_map(|source| source.runtime()),
+            )
+    }
+
+    pub fn unified_mapping_api_version(
+        &self,
+    ) -> Result<UnifiedMappingApiVersion, DifferentMappingApiVersions> {
+        UnifiedMappingApiVersion::try_from_versions(self.api_versions())
+    }
+
+    pub fn template_idx_and_name(&self) -> impl Iterator<Item = (u32, String)> + '_ {
+        // We cannot include static data sources in the map because a static data source and a
+        // template may have the same name in the manifest. Duplicated with
+        // `UnresolvedSubgraphManifest::template_idx_and_name`.
+        let ds_len = self.data_sources.len() as u32;
+        self.templates
+            .iter()
+            .map(|t| t.name().to_owned())
+            .enumerate()
+            .map(move |(idx, name)| (ds_len + idx as u32, name))
+    }
+}
+
+impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
+    pub fn parse(
+        id: DeploymentHash,
+        mut raw: serde_yaml::Mapping,
+    ) -> Result<Self, SubgraphManifestResolveError> {
+        // Inject the IPFS hash as the ID of the subgraph into the definition.
+        raw.insert("id".into(), id.to_string().into());
+
+        serde_yaml::from_value(raw.into()).map_err(Into::into)
+    }
+
+    pub async fn resolve(
+        self,
+        resolver: &Arc<dyn LinkResolver>,
+        logger: &Logger,
+        max_spec_version: semver::Version,
+    ) -> Result<SubgraphManifest<C>, SubgraphManifestResolveError> {
+        let UnresolvedSubgraphManifest {
+            id,
+            spec_version,
+            features,
+            description,
+            repository,
+            schema,
+            data_sources,
+            graft,
+            templates,
+            chain,
+        } = self;
+
+        if !(MIN_SPEC_VERSION..=max_spec_version.clone()).contains(&spec_version) {
+            return Err(anyhow!(
+                "This Graph Node only supports manifest spec versions between {} and {}, but subgraph `{}` uses `{}`",
+                MIN_SPEC_VERSION,
+                max_spec_version,
+                id,
+                spec_version
+            ).into());
+        }
+
+        let ds_count = data_sources.len();
+        if ds_count as u64 + templates.len() as u64 > u32::MAX as u64 {
+            return Err(
+                anyhow!("Subgraph has too many declared data sources and templates",).into(),
+            );
+        }
+
+        let (schema, data_sources, templates) = try_join3(
+            schema.resolve(id.clone(), resolver, logger),
+            data_sources
+                .into_iter()
+                .enumerate()
+                .map(|(idx, ds)| ds.resolve(resolver, logger, idx as u32))
+                .collect::<FuturesOrdered<_>>()
+                .try_collect::<Vec<_>>(),
+            templates
+                .into_iter()
+                .enumerate()
+                .map(|(idx, template)| {
+                    template.resolve(resolver, logger, ds_count as u32 + idx as u32)
+                })
+                .collect::<FuturesOrdered<_>>()
+                .try_collect::<Vec<_>>(),
+        )
+        .await?;
+
+        for ds in &data_sources {
+            ensure!(
+                semver::VersionReq::parse(&format!("<= {}", ENV_VARS.mappings.max_api_version))
+                    .unwrap()
+                    .matches(&ds.api_version()),
+                "The maximum supported mapping API version of this indexer is {}, but `{}` was found",
+                ENV_VARS.mappings.max_api_version,
+                ds.api_version()
+            );
+        }
+
+        if spec_version < SPEC_VERSION_0_0_7
+            && data_sources
+                .iter()
+                .any(|ds| OFFCHAIN_KINDS.contains(&ds.kind()))
+        {
+            bail!(
+                "Offchain data sources not supported prior to {}",
+                SPEC_VERSION_0_0_7
+            );
+        }
+
+        Ok(SubgraphManifest {
+            id,
+            spec_version,
+            features,
+            description,
+            repository,
+            schema,
+            data_sources,
+            graft,
+            templates,
+            chain,
+        })
+    }
+}
+
+/// Important details about the current state of a subgraph deployment
+/// used while executing queries against a deployment
+///
+/// The `reorg_count` and `max_reorg_depth` fields are maintained (in the
+/// database) by `store::metadata::forward_block_ptr` and
+/// `store::metadata::revert_block_ptr` which get called as part of transacting
+/// new entities into the store or reverting blocks.
+#[derive(Debug, Clone)]
+pub struct DeploymentState {
+    pub id: DeploymentHash,
+    /// The number of blocks that were ever reverted in this subgraph. This
+    /// number increases monotonically every time a block is reverted
+    pub reorg_count: u32,
+    /// The maximum number of blocks we ever reorged without moving a block
+    /// forward in between
+    pub max_reorg_depth: u32,
+    /// The last block that the subgraph has processed
+    pub latest_block: BlockPtr,
+    /// The earliest block that the subgraph has processed
+    pub earliest_block_number: BlockNumber,
+}
+
+impl DeploymentState {
+    /// Is this subgraph deployed and has it processed any blocks?
+    pub fn is_deployed(&self) -> bool {
+        self.latest_block.number > 0
+    }
+
+    pub fn block_queryable(&self, block: BlockNumber) -> Result<(), String> {
+        if block > self.latest_block.number {
+            return Err(format!(
+                "subgraph {} has only indexed up to block number {} \
+                        and data for block number {} is therefore not yet available",
+                self.id, self.latest_block.number, block
+            ));
+        }
+        if block < self.earliest_block_number {
+            return Err(format!(
+                "subgraph {} only has data starting at block number {} \
+                            and data for block number {} is therefore not available",
+                self.id, self.earliest_block_number, block
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn display_vector(input: &[impl std::fmt::Display]) -> impl std::fmt::Display {
+    let formatted_errors = input
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<String>>()
+        .join("; ");
+    format!("[{}]", formatted_errors)
+}
+
 #[test]
 fn test_subgraph_name_validation() {
     assert!(SubgraphName::new("a").is_ok());
@@ -215,730 +879,22 @@ fn test_subgraph_name_validation() {
     assert!(SubgraphName::new("aaaa+aaaaa").is_err());
     assert!(SubgraphName::new("a/graphql").is_err());
     assert!(SubgraphName::new("graphql/a").is_err());
-    assert!(SubgraphName::new("this-component-is-longer-than-the-length-limit").is_err());
+    assert!(SubgraphName::new("this-component-is-very-long-but-we-dont-care").is_ok());
 }
 
-/// Result of a creating a subgraph in the registar.
-#[derive(Serialize)]
-pub struct CreateSubgraphResult {
-    /// The ID of the subgraph that was created.
-    pub id: String,
-}
-
-#[derive(Fail, Debug)]
-pub enum SubgraphRegistrarError {
-    #[fail(display = "subgraph resolve error: {}", _0)]
-    ResolveError(SubgraphManifestResolveError),
-    #[fail(display = "subgraph already exists: {}", _0)]
-    NameExists(String),
-    #[fail(display = "subgraph name not found: {}", _0)]
-    NameNotFound(String),
-    #[fail(display = "Ethereum network not supported by registrar: {}", _0)]
-    NetworkNotSupported(String),
-    #[fail(display = "deployment not found: {}", _0)]
-    DeploymentNotFound(String),
-    #[fail(display = "deployment assignment unchanged: {}", _0)]
-    DeploymentAssignmentUnchanged(String),
-    #[fail(display = "subgraph registrar internal query error: {}", _0)]
-    QueryExecutionError(QueryExecutionError),
-    #[fail(display = "subgraph registrar error with store: {}", _0)]
-    StoreError(StoreError),
-    #[fail(display = "subgraph validation error: {:?}", _0)]
-    ManifestValidationError(Vec<SubgraphManifestValidationError>),
-    #[fail(display = "subgraph registrar error: {}", _0)]
-    Unknown(failure::Error),
-}
-
-impl From<QueryExecutionError> for SubgraphRegistrarError {
-    fn from(e: QueryExecutionError) -> Self {
-        SubgraphRegistrarError::QueryExecutionError(e)
-    }
-}
-
-impl From<StoreError> for SubgraphRegistrarError {
-    fn from(e: StoreError) -> Self {
-        SubgraphRegistrarError::StoreError(e)
-    }
-}
-
-impl From<Error> for SubgraphRegistrarError {
-    fn from(e: Error) -> Self {
-        SubgraphRegistrarError::Unknown(e)
-    }
-}
-
-impl From<SubgraphManifestValidationError> for SubgraphRegistrarError {
-    fn from(e: SubgraphManifestValidationError) -> Self {
-        SubgraphRegistrarError::ManifestValidationError(vec![e])
-    }
-}
-
-#[derive(Fail, Debug)]
-pub enum SubgraphAssignmentProviderError {
-    #[fail(display = "Subgraph resolve error: {}", _0)]
-    ResolveError(SubgraphManifestResolveError),
-    #[fail(display = "Failed to load dynamic data sources: {}", _0)]
-    DynamicDataSourcesError(failure::Error),
-    /// Occurs when attempting to remove a subgraph that's not hosted.
-    #[fail(display = "Subgraph with ID {} already running", _0)]
-    AlreadyRunning(SubgraphDeploymentId),
-    #[fail(display = "Subgraph with ID {} is not running", _0)]
-    NotRunning(SubgraphDeploymentId),
-    /// Occurs when a subgraph's GraphQL schema is invalid.
-    #[fail(display = "GraphQL schema error: {}", _0)]
-    SchemaValidationError(failure::Error),
-    #[fail(
-        display = "Error building index for subgraph {}, entity {} and attribute {}",
-        _0, _1, _2
-    )]
-    BuildIndexesError(String, String, String),
-    #[fail(display = "Subgraph provider error: {}", _0)]
-    Unknown(failure::Error),
-}
-
-impl From<Error> for SubgraphAssignmentProviderError {
-    fn from(e: Error) -> Self {
-        SubgraphAssignmentProviderError::Unknown(e)
-    }
-}
-
-impl From<::diesel::result::Error> for SubgraphAssignmentProviderError {
-    fn from(e: ::diesel::result::Error) -> Self {
-        SubgraphAssignmentProviderError::Unknown(e.into())
-    }
-}
-
-/// Events emitted by [SubgraphAssignmentProvider](trait.SubgraphAssignmentProvider.html) implementations.
-#[derive(Debug, PartialEq)]
-pub enum SubgraphAssignmentProviderEvent {
-    /// A subgraph with the given manifest should start processing.
-    SubgraphStart(SubgraphManifest),
-    /// The subgraph with the given ID should stop processing.
-    SubgraphStop(SubgraphDeploymentId),
-}
-
-#[derive(Fail, Debug)]
-pub enum SubgraphManifestValidationError {
-    #[fail(display = "subgraph source address is required")]
-    SourceAddressRequired,
-    #[fail(display = "subgraph cannot index data from different Ethereum networks")]
-    MultipleEthereumNetworks,
-    #[fail(display = "subgraph must have at least one Ethereum network data source")]
-    EthereumNetworkRequired,
-    #[fail(display = "subgraph data source has too many similar block handlers")]
-    DataSourceBlockHandlerLimitExceeded,
-}
-
-#[derive(Fail, Debug)]
-pub enum SubgraphManifestResolveError {
-    #[fail(display = "parse error: {}", _0)]
-    ParseError(serde_yaml::Error),
-    #[fail(display = "subgraph is not UTF-8")]
-    NonUtf8,
-    #[fail(display = "subgraph is not valid YAML")]
-    InvalidFormat,
-    #[fail(display = "resolve error: {}", _0)]
-    ResolveError(failure::Error),
-}
-
-impl From<serde_yaml::Error> for SubgraphManifestResolveError {
-    fn from(e: serde_yaml::Error) -> Self {
-        SubgraphManifestResolveError::ParseError(e)
-    }
-}
-
-/// IPLD link.
-#[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
-pub struct Link {
-    #[serde(rename = "/")]
-    pub link: String,
-}
-
-impl From<String> for Link {
-    fn from(s: String) -> Self {
-        Self { link: s }
-    }
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-pub struct SchemaData {
-    pub file: Link,
-}
-
-impl SchemaData {
-    pub fn resolve(
-        self,
-        id: SubgraphDeploymentId,
-        resolver: &impl LinkResolver,
-        logger: Logger,
-    ) -> impl Future<Item = Schema, Error = failure::Error> + Send {
-        info!(logger, "Resolve schema"; "link" => &self.file.link);
-
-        resolver
-            .cat(&logger, &self.file)
-            .and_then(|schema_bytes| Schema::parse(&String::from_utf8(schema_bytes)?, id))
-    }
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-pub struct Source {
-    #[serde(default, deserialize_with = "deserialize_address")]
-    pub address: Option<Address>,
-    pub abi: String,
-}
-
-impl From<EthereumContractSourceEntity> for Source {
-    fn from(entity: EthereumContractSourceEntity) -> Self {
-        Self {
-            address: entity.address,
-            abi: entity.abi,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
-pub struct TemplateSource {
-    pub abi: String,
-}
-
-impl From<EthereumContractDataSourceTemplateSourceEntity> for TemplateSource {
-    fn from(entity: EthereumContractDataSourceTemplateSourceEntity) -> Self {
-        Self { abi: entity.abi }
-    }
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-pub struct UnresolvedMappingABI {
-    pub name: String,
-    pub file: Link,
-}
-
-impl From<EthereumContractAbiEntity> for UnresolvedMappingABI {
-    fn from(entity: EthereumContractAbiEntity) -> Self {
-        Self {
-            name: entity.name,
-            file: entity.file.into(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct MappingABI {
-    pub name: String,
-    pub contract: Contract,
-    pub link: Link,
-}
-
-impl UnresolvedMappingABI {
-    pub fn resolve(
-        self,
-        resolver: &impl LinkResolver,
-        logger: Logger,
-    ) -> impl Future<Item = MappingABI, Error = failure::Error> + Send {
-        info!(
-            logger,
-            "Resolve ABI";
-            "name" => &self.name,
-            "link" => &self.file.link
-        );
-
-        resolver
-            .cat(&logger, &self.file)
-            .and_then(|contract_bytes| {
-                let contract = Contract::load(&*contract_bytes).map_err(SyncFailure::new)?;
-                Ok(MappingABI {
-                    name: self.name,
-                    contract,
-                    link: self.file,
-                })
-            })
-    }
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-pub struct MappingBlockHandler {
-    pub handler: String,
-    pub filter: Option<BlockHandlerFilter>,
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum BlockHandlerFilter {
-    // Call filter will trigger on all blocks where the data source contract
-    // address has been called
-    Call,
-}
-
-impl From<EthereumBlockHandlerEntity> for MappingBlockHandler {
-    fn from(entity: EthereumBlockHandlerEntity) -> Self {
-        Self {
-            handler: entity.handler,
-            filter: None,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-pub struct MappingCallHandler {
-    pub function: String,
-    pub handler: String,
-}
-
-impl From<EthereumCallHandlerEntity> for MappingCallHandler {
-    fn from(entity: EthereumCallHandlerEntity) -> Self {
-        Self {
-            function: entity.function,
-            handler: entity.handler,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-pub struct MappingEventHandler {
-    pub event: String,
-    pub topic0: Option<H256>,
-    pub handler: String,
-}
-
-impl MappingEventHandler {
-    pub fn topic0(&self) -> H256 {
-        self.topic0
-            .unwrap_or_else(|| string_to_h256(&self.event.replace("indexed ", "")))
-    }
-}
-
-impl From<EthereumContractEventHandlerEntity> for MappingEventHandler {
-    fn from(entity: EthereumContractEventHandlerEntity) -> Self {
-        Self {
-            event: entity.event,
-            topic0: entity.topic0,
-            handler: entity.handler,
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UnresolvedMapping {
-    pub kind: String,
-    pub api_version: String,
-    pub language: String,
-    pub entities: Vec<String>,
-    pub abis: Vec<UnresolvedMappingABI>,
-    #[serde(default)]
-    pub block_handlers: Vec<MappingBlockHandler>,
-    #[serde(default)]
-    pub call_handlers: Vec<MappingCallHandler>,
-    #[serde(default)]
-    pub event_handlers: Vec<MappingEventHandler>,
-    pub file: Link,
-}
-
-#[derive(Clone, Debug)]
-pub struct Mapping {
-    pub kind: String,
-    pub api_version: String,
-    pub language: String,
-    pub entities: Vec<String>,
-    pub abis: Vec<MappingABI>,
-    pub block_handlers: Vec<MappingBlockHandler>,
-    pub call_handlers: Vec<MappingCallHandler>,
-    pub event_handlers: Vec<MappingEventHandler>,
-    pub runtime: Arc<Module>,
-    pub link: Link,
-}
-
-impl UnresolvedMapping {
-    pub fn resolve(
-        self,
-        resolver: &impl LinkResolver,
-        logger: Logger,
-    ) -> impl Future<Item = Mapping, Error = failure::Error> + Send {
-        let UnresolvedMapping {
-            kind,
-            api_version,
-            language,
-            entities,
-            abis,
-            block_handlers,
-            call_handlers,
-            event_handlers,
-            file: link,
-        } = self;
-
-        info!(logger, "Resolve mapping"; "link" => &link.link);
-
-        // resolve each abi
-        stream::futures_ordered(
-            abis.into_iter()
-                .map(|unresolved_abi| unresolved_abi.resolve(resolver, logger.clone())),
-        )
-        .collect()
-        .join(
-            resolver.cat(&logger, &link).and_then(|module_bytes| {
-                Ok(Arc::new(parity_wasm::deserialize_buffer(&module_bytes)?))
-            }),
-        )
-        .map(move |(abis, runtime)| Mapping {
-            kind,
-            api_version,
-            language,
-            entities,
-            abis,
-            block_handlers: block_handlers.clone(),
-            call_handlers: call_handlers.clone(),
-            event_handlers: event_handlers.clone(),
-            runtime,
-            link,
-        })
-    }
-}
-
-impl From<EthereumContractMappingEntity> for UnresolvedMapping {
-    fn from(entity: EthereumContractMappingEntity) -> Self {
-        Self {
-            kind: entity.kind,
-            api_version: entity.api_version,
-            language: entity.language,
-            entities: entity.entities,
-            abis: entity.abis.into_iter().map(Into::into).collect(),
-            event_handlers: entity.event_handlers.into_iter().map(Into::into).collect(),
-            call_handlers: entity.call_handlers.into_iter().map(Into::into).collect(),
-            block_handlers: entity.block_handlers.into_iter().map(Into::into).collect(),
-            file: entity.file.into(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
-pub struct BaseDataSource<M, T> {
-    pub kind: String,
-    pub network: Option<String>,
-    pub name: String,
-    pub source: Source,
-    pub mapping: M,
-    #[serde(default)]
-    pub templates: Vec<T>, // Deprecated in manifest spec version 0.0.2
-}
-
-pub type UnresolvedDataSource = BaseDataSource<UnresolvedMapping, UnresolvedDataSourceTemplate>;
-pub type DataSource = BaseDataSource<Mapping, DataSourceTemplate>;
-
-impl UnresolvedDataSource {
-    pub fn resolve(
-        self,
-        resolver: &impl LinkResolver,
-        logger: Logger,
-    ) -> impl Future<Item = DataSource, Error = failure::Error> {
-        let UnresolvedDataSource {
-            kind,
-            network,
-            name,
-            source,
-            mapping,
-            templates,
-        } = self;
-
-        info!(logger, "Resolve data source"; "name" => &name);
-
-        mapping
-            .resolve(resolver, logger.clone())
-            .join(
-                stream::futures_ordered(
-                    templates
-                        .into_iter()
-                        .map(|template| template.resolve(resolver, logger.clone())),
-                )
-                .collect(),
-            )
-            .map(|(mapping, templates)| DataSource {
-                kind,
-                network,
-                name,
-                source,
-                mapping,
-                templates,
-            })
-    }
-}
-
-impl DataSource {
-    pub fn try_from_template(
-        template: DataSourceTemplate,
-        params: &Vec<String>,
-    ) -> Result<Self, failure::Error> {
-        // Obtain the address from the parameters
-        let string = params
-            .get(0)
-            .ok_or_else(|| {
-                format_err!(
-                    "Failed to create data source from template `{}`: address parameter is missing",
-                    template.name
-                )
-            })?
-            .trim_start_matches("0x");
-
-        let address = Address::from_str(string).map_err(|e| {
-            format_err!(
-                "Failed to create data source from template `{}`: invalid address provided: {}",
-                template.name,
-                e
-            )
-        })?;
-
-        Ok(DataSource {
-            kind: template.kind,
-            network: template.network,
-            name: template.name,
-            source: Source {
-                address: Some(address),
-                abi: template.source.abi,
-            },
-            mapping: template.mapping,
-            templates: Vec::new(),
-        })
-    }
-}
-
-impl From<EthereumContractDataSourceEntity> for UnresolvedDataSource {
-    fn from(entity: EthereumContractDataSourceEntity) -> Self {
-        Self {
-            kind: entity.kind,
-            network: entity.network,
-            name: entity.name,
-            source: entity.source.into(),
-            mapping: entity.mapping.into(),
-            templates: entity.templates.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
-pub struct BaseDataSourceTemplate<M> {
-    pub kind: String,
-    pub network: Option<String>,
-    pub name: String,
-    pub source: TemplateSource,
-    pub mapping: M,
-}
-
-impl From<EthereumContractDataSourceTemplateEntity> for UnresolvedDataSourceTemplate {
-    fn from(entity: EthereumContractDataSourceTemplateEntity) -> Self {
-        Self {
-            kind: entity.kind,
-            network: entity.network,
-            name: entity.name,
-            source: entity.source.into(),
-            mapping: entity.mapping.into(),
-        }
-    }
-}
-
-pub type UnresolvedDataSourceTemplate = BaseDataSourceTemplate<UnresolvedMapping>;
-pub type DataSourceTemplate = BaseDataSourceTemplate<Mapping>;
-
-impl UnresolvedDataSourceTemplate {
-    pub fn resolve(
-        self,
-        resolver: &impl LinkResolver,
-        logger: Logger,
-    ) -> impl Future<Item = DataSourceTemplate, Error = failure::Error> {
-        let UnresolvedDataSourceTemplate {
-            kind,
-            network,
-            name,
-            source,
-            mapping,
-        } = self;
-
-        info!(logger, "Resolve data source template"; "name" => &name);
-
-        mapping
-            .resolve(resolver, logger)
-            .map(|mapping| DataSourceTemplate {
-                kind,
-                network,
-                name,
-                source,
-                mapping,
-            })
-    }
-}
-
-impl DataSourceTemplate {
-    pub fn has_call_handler(&self) -> bool {
-        !self.mapping.call_handlers.is_empty()
-    }
-
-    pub fn has_block_handler_with_call_filter(&self) -> bool {
-        self.mapping
-            .block_handlers
-            .iter()
-            .find(|handler| match handler.filter {
-                Some(BlockHandlerFilter::Call) => true,
-                _ => false,
-            })
-            .is_some()
-    }
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BaseSubgraphManifest<S, D, T> {
-    pub id: SubgraphDeploymentId,
-    pub location: String,
-    pub spec_version: String,
-    pub description: Option<String>,
-    pub repository: Option<String>,
-    pub schema: S,
-    pub data_sources: Vec<D>,
-    #[serde(default)]
-    pub templates: Vec<T>,
-}
-
-/// Consider two subgraphs to be equal if they come from the same IPLD link.
-impl<S, D, T> PartialEq for BaseSubgraphManifest<S, D, T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.location == other.location
-    }
-}
-
-pub type UnresolvedSubgraphManifest =
-    BaseSubgraphManifest<SchemaData, UnresolvedDataSource, UnresolvedDataSourceTemplate>;
-pub type SubgraphManifest = BaseSubgraphManifest<Schema, DataSource, DataSourceTemplate>;
-
-impl SubgraphManifest {
-    /// Entry point for resolving a subgraph definition.
-    /// Right now the only supported links are of the form:
-    /// `/ipfs/QmUmg7BZC1YP1ca66rRtWKxpXp77WgVHrnv263JtDuvs2k`
-    pub fn resolve(
-        link: Link,
-        resolver: Arc<impl LinkResolver>,
-        logger: Logger,
-    ) -> impl Future<Item = Self, Error = SubgraphManifestResolveError> + Send {
-        info!(logger, "Resolve manifest"; "link" => &link.link);
-
-        resolver
-            .cat(&logger, &link)
-            .map_err(SubgraphManifestResolveError::ResolveError)
-            .and_then(move |file_bytes| {
-                let file = String::from_utf8(file_bytes.to_vec())
-                    .map_err(|_| SubgraphManifestResolveError::NonUtf8)?;
-                let mut raw: serde_yaml::Value = serde_yaml::from_str(&file)?;
-                {
-                    let raw_mapping = raw
-                        .as_mapping_mut()
-                        .ok_or(SubgraphManifestResolveError::InvalidFormat)?;
-
-                    // Inject the IPFS hash as the ID of the subgraph
-                    // into the definition.
-                    raw_mapping.insert(
-                        serde_yaml::Value::from("id"),
-                        serde_yaml::Value::from(link.link.trim_start_matches("/ipfs/")),
-                    );
-
-                    // Inject the IPFS link as the location of the data
-                    // source into the definition
-                    raw_mapping.insert(
-                        serde_yaml::Value::from("location"),
-                        serde_yaml::Value::from(link.link),
-                    );
-                }
-                // Parse the YAML data into an UnresolvedSubgraphManifest
-                let unresolved: UnresolvedSubgraphManifest = serde_yaml::from_value(raw)?;
-                Ok(unresolved)
-            })
-            .and_then(move |unresolved| {
-                unresolved
-                    .resolve(&*resolver, logger)
-                    .map_err(SubgraphManifestResolveError::ResolveError)
-            })
-    }
-
-    pub fn network_name(&self) -> Result<String, SubgraphManifestValidationError> {
-        let mut ethereum_networks: Vec<Option<String>> = self
-            .data_sources
-            .iter()
-            .cloned()
-            .filter(|d| d.kind == "ethereum/contract".to_string())
-            .map(|d| d.network)
-            .collect();
-        ethereum_networks.sort();
-        ethereum_networks.dedup();
-        match ethereum_networks.len() {
-            0 => Err(SubgraphManifestValidationError::EthereumNetworkRequired),
-            1 => match ethereum_networks.first().and_then(|n| n.clone()) {
-                Some(n) => Ok(n),
-                None => Err(SubgraphManifestValidationError::EthereumNetworkRequired),
-            },
-            _ => Err(SubgraphManifestValidationError::MultipleEthereumNetworks),
-        }
-    }
-}
-
-impl UnresolvedSubgraphManifest {
-    pub fn resolve(
-        self,
-        resolver: &impl LinkResolver,
-        logger: Logger,
-    ) -> impl Future<Item = SubgraphManifest, Error = failure::Error> {
-        let UnresolvedSubgraphManifest {
-            id,
-            location,
-            spec_version,
-            description,
-            repository,
-            schema,
-            data_sources,
-            templates,
-        } = self;
-
-        match semver::Version::parse(&spec_version) {
-            // Before this check was introduced, there were already subgraphs in
-            // the wild with spec version 0.0.3, due to confusion with the api
-            // version. To avoid breaking those, we accept 0.0.3 though it
-            // doesn't exist. In the future we should not use 0.0.3 as version
-            // and skip to 0.0.4 to avoid ambiguity.
-            Ok(ref ver) if *ver <= semver::Version::new(0, 0, 3) => {}
-            _ => {
-                return Box::new(future::err(format_err!(
-                    "This Graph Node only supports manifest spec versions <= 0.0.2,
-                    but subgraph `{}` uses `{}`",
-                    id,
-                    spec_version
-                ))) as Box<dyn Future<Item = _, Error = _> + Send>;
-            }
-        }
-
-        Box::new(
-            schema
-                .resolve(id.clone(), resolver, logger.clone())
-                .join(
-                    stream::futures_ordered(
-                        data_sources
-                            .into_iter()
-                            .map(|ds| ds.resolve(resolver, logger.clone())),
-                    )
-                    .collect(),
-                )
-                .join(
-                    stream::futures_ordered(
-                        templates
-                            .into_iter()
-                            .map(|template| template.resolve(resolver, logger.clone())),
-                    )
-                    .collect(),
-                )
-                .map(|((schema, data_sources), templates)| SubgraphManifest {
-                    id,
-                    location,
-                    spec_version,
-                    description,
-                    repository,
-                    schema,
-                    data_sources,
-                    templates,
-                }),
-        )
-    }
+#[test]
+fn test_display_vector() {
+    let manifest_validation_error = SubgraphRegistrarError::ManifestValidationError(vec![
+        SubgraphManifestValidationError::NoDataSources,
+        SubgraphManifestValidationError::SourceAddressRequired,
+    ]);
+
+    let expected_display_message =
+	"subgraph validation error: [subgraph has no data sources; subgraph source address is required]"
+	.to_string();
+
+    assert_eq!(
+        expected_display_message,
+        format!("{}", manifest_validation_error)
+    )
 }

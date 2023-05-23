@@ -22,7 +22,7 @@ To answer this question, you need to process all [`Birth` events](https://github
 
 Even for this relatively simple question, it would take hours or even days for a dApp running in a browser to find an answer. Indexing and caching data off blockchains is hard. There are also edge cases around finality, chain reorganizations, uncled blocks, etc., which make it even more difficult to display deterministic data to the end user.
 
-The Graph solves this issue by providing an open source node implementation, [Graph Node](../README.md), which handles indexing and caching of blockchain data. The entire community can contribute to and utilize this tool. In the current implemention, it exposes functionality through a GraphQL API for end users.
+The Graph solves this issue by providing an open source node implementation, [Graph Node](../README.md), which handles indexing and caching of blockchain data. The entire community can contribute to and utilize this tool. In the current implementation, it exposes functionality through a GraphQL API for end users.
 
 ### 0.2 How Does It Work?
 
@@ -44,12 +44,12 @@ The high-level dataflow for a dApp using The Graph is as follows:
 Three repositories are relevant to building on The Graph:
 1. [Graph Node](../README.md) – A server implementation for indexing, caching, and serving queries against data from Ethereum.
 2. [Graph CLI](https://github.com/graphprotocol/graph-cli) – A CLI for building and compiling projects that are deployed to the Graph Node.
-3. [Graph TypeScript Library](https://github.com/graphprotocol/graph-ts) – TypeScript/AssemblyScript library for writing subgraph mappings to be deployed to The Graph.
+3. [Graph TypeScript Library](https://github.com/graphprotocol/graph-tooling/tree/main/packages/ts) – TypeScript/AssemblyScript library for writing subgraph mappings to be deployed to The Graph.
 
 ### 0.4 Getting Started Overview
 Below, we outline the required steps to build a subgraph from scratch, which will serve queries from a GraphQL endpoint. The three major steps are:
 
-1. [Define the subgraph](#1-defining-the-subgraph)
+1. [Define the subgraph](#1-define-the-subgraph)
     1. [Define the data sources and create a manifest](#11-define-the-data-sources-and-create-a-manifest)
 
     2. [Create the GraphQL schema](#12-create-the-graphql-schema-for-the-data-source)
@@ -62,7 +62,7 @@ Below, we outline the required steps to build a subgraph from scratch, which wil
 
     2. [Create the Postgres database](#22-create-the-postgres-db)
 
-    3. [Start the Graph Node and Connect to an Etheruem node](#23-starting-the-graph-node-and-connecting-to-an-etheruem-node)
+    3. [Start the Graph Node and Connect to an Ethereum node](#23-starting-the-graph-node-and-connecting-to-an-ethereum-node)
 
     4. [Deploy the subgraph](#24-deploying-the-subgraph)
 3. Query the subgraph
@@ -123,7 +123,7 @@ The ABI JSON file must contain the correct ABI to source all the events or any c
 * If you are building a subgraph for a public project, you can download that project to your computer and generate the ABI by using [`truffle compile`](https://truffleframework.com/docs/truffle/overview) or `solc` to compile. This creates the ABI files that you can then transfer to your subgraph `/abi` folder.
 * Sometimes, you can also find the ABI on [Etherscan](https://etherscan.io), but this is not always reliable because the uploaded ABI may be out of date. Make sure you have the correct ABI. Otherwise, you will not be able to start a Graph Node.
 
-If you run into trouble here, double check the ABI and ensure that the event signatures exist *exactly* as you expect them by examining the smart contract code you are sourcing. Also, note with the ABI, you only need the array for the ABI. Compiling the contracts locally results in a `.json` file that contains the complete ABI nested within the `.json` file under the key `abi`.
+If you run into trouble here, double-check the ABI and ensure that the event signatures exist *exactly* as you expect them by examining the smart contract code you are sourcing. Also, note with the ABI, you only need the array for the ABI. Compiling the contracts locally results in a `.json` file that contains the complete ABI nested within the `.json` file under the key `abi`.
 
 An example `abi` for the `Transfer` event is shown below and would be stored in the `/abi` folder with the name `ERC721ABI.json`:
 
@@ -171,7 +171,7 @@ type Token @entity {
 
 This `entity` tracks a single ERC721 token on Ethereum by its ID and the current owner. The **`ID` field is required** and stores values of the ID type, which are strings. The `ID` must be a unique value so that it can be placed into the store. For an ERC721 token, the unique ID could be the token ID because that value is unique to that coin.
 
-The exclamation mark represents the fact that that field must be set when the entity is stored in the database, i.e., it cannot be `null`. See the [Schema API](graphql-api.md#3-schema) for a complete reference on defining the schema for The Graph.
+The exclamation mark represents the fact that that field must be set when the entity is stored in the database, i.e., it cannot be `null`. See the [Schema API](https://github.com/graphprotocol/docs/blob/main/pages/en/querying/graphql-api.mdx#schema) for a complete reference on defining the schema for The Graph.
 
 When you complete the schema, add its path to the top-level `schema` key in the subgraph manifest. See the code below for an example:
 
@@ -238,7 +238,7 @@ A few things to note from this code:
 
 The only way that entities may be added to The Graph is by calling `<entity>.save()`, which may be called multiple times in an event handler. `<entity>.save()` will only set the entity attributes that have explicitly been set on the `entity`. Attributes that are not explicitly set or are unset by calling `Entity.unset(<attribute>)` will not be overwritten. This means you can safely update one field of an entity and not worry about overwriting other fields not referenced in the mapping.
 
-The definitiion for `<entity>.save()` is:
+The definition for `<entity>.save()` is:
 
 ```typescript
 entity.save() // Entity is representative of the entity type being updated. In our example above, it is Token.
@@ -246,7 +246,7 @@ entity.save() // Entity is representative of the entity type being updated. In o
 
  `<entity>.load()` expects the entity type and ID of the entity. Use `<entity>.load()` to retrieve information previously added with `<entity>.save()`.
 
-The definitiion for `<entity>.load()` is:
+The definition for `<entity>.load()` is:
 
  ```typescript
 entity.load() // Entity is representative of the entity type being updated. In our example above, it is Token.
@@ -315,7 +315,7 @@ createdb <POSTGRES_DB_NAME>
 ```
 Name the database something relevant to the project so that you always know how to access it.
 
-### 2.3 Start the Graph Node and Connect to an Etheruem Node
+### 2.3 Start the Graph Node and Connect to an Ethereum Node
 
 When you start the Graph Node, you need to specify which Ethereum network it should connect to. There are three common ways to do this:
  * Infura
@@ -342,7 +342,7 @@ Also, note that the Postgres database may not have a password at all. If that is
 
 #### 2.3.2 Local Geth or Parity Node
 
-This is the speediest way to get mainnet or testnet data. The problem is that if you do not already have a synced [geth](https://github.com/ethereum/go-ethereum/wiki/geth) or [parity](https://github.com/paritytech/parity-ethereum) node, you will have to sync one, which takes a very long time and takes up a lot of space. Additionally, note that geth `fast sync` works. So, if you are starting from scratch, this is the fastest way to get caught up, but expect at least 12 hours of syncing on a modern laptop with a good internet connection to sync geth. Normal mode geth or parity will take much longer. Use the following geth command to start syncing:
+This is the speediest way to get mainnet or testnet data. The problem is that if you do not already have a synced [geth](https://geth.ethereum.org/docs/getting-started) or [parity](https://github.com/paritytech/parity-ethereum) node, you will have to sync one, which takes a very long time and takes up a lot of space. Additionally, note that geth `fast sync` works. So, if you are starting from scratch, this is the fastest way to get caught up, but expect at least 12 hours of syncing on a modern laptop with a good internet connection to sync geth. Normal mode geth or parity will take much longer. Use the following geth command to start syncing:
 
 `geth --syncmode "fast" --rpc --ws --wsorigins="*" --rpcvhosts="*" --cache 1024`
 
@@ -417,7 +417,7 @@ Depending on how many events have been emitted by your smart contracts, it could
 ## 3 Query the Local Graph Node
 With the subgraph deployed to the locally running Graph Node, visit http://127.0.0.1:8000/ to open up a [GraphiQL](https://github.com/graphql/graphiql) interface where you can explore the deployed GraphQL API for the subgraph by issuing queries and viewing the schema.
 
-We provide a few simple examples below, but please see the [Query API](graphql-api.md#1-queries) for a complete reference on how to query the subgraph's entities.
+We provide a few simple examples below, but please see the [Query API](https://github.com/graphprotocol/docs/blob/main/pages/en/querying/graphql-api.mdx#queries) for a complete reference on how to query the subgraph's entities.
 
 Query the `Token` entities:
 ```graphql
@@ -464,7 +464,7 @@ Using the AssemblyScript built-in functions for arrays is the way to go. Find th
 
 ### 5.2 Getting Data from Multiple Versions of Your Contracts
 
-If you have launched multiple versions of your smart contracts onto Ethereum, it is very easy to source data from all of them. This simply requires you to add all versions of the contracts to the `subgraph.yaml` file and handle the events from each contract. Design your schema to consider both versions, and handle any changes to the event signatures that are emitted from each version. See the [0x Subgraph](thub.com/graphprotocol/0x-subgraph/tree/master/mappings) for an implementation of multiple versions of smart contracts being ingested by a subgraph.
+If you have launched multiple versions of your smart contracts onto Ethereum, it is very easy to source data from all of them. This simply requires you to add all versions of the contracts to the `subgraph.yaml` file and handle the events from each contract. Design your schema to consider both versions, and handle any changes to the event signatures that are emitted from each version. See the [0x Subgraph](https://github.com/graphprotocol/0x-subgraph/tree/master/src/mappings) for an implementation of multiple versions of smart contracts being ingested by a subgraph.
 
 ## 5 Example Subgraphs
 
